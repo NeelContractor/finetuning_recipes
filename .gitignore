@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+models/*
+*txt
+*jsonl
+*json
+*csv
+evals/*
+
+.envrc
+.env
+data/
+tutorial_notebooks/*
+*png
+preference_optimization/evals/*
+preference_optimization/diversity_evals/evals/*
+local_scripts/*

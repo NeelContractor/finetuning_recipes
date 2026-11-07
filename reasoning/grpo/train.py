@@ -1,13 +1,11 @@
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    get_linear_schedule_with_warmup,
 )
 import argparse
 import json
 import paper_dataset
 import torch
-from prompt_utils import system_prompt 
 from grpo_utils import (
     calculate_entropy,
     calculate_grpo_loss,
@@ -32,6 +30,31 @@ try:
     from reasoning.env import score_completions
 except ModuleNotFoundError:
     from env import score_completions
+
+
+def _pick_dtype():
+    """Use bf16 on Ampere+, fp16 on older CUDA GPUs (T4/P100), fp32 on CPU."""
+    if torch.cuda.is_available():
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.float32
+
+
+def _pick_attn_implementation():
+    """flash-attn v2 needs Ampere+ (sm80); fall back to SDPA on T4/P100."""
+    if not torch.cuda.is_available():
+        return "sdpa"
+    major, _ = torch.cuda.get_device_capability()
+    if major >= 8:
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            return "sdpa"
+        return "flash_attention_2"
+    return "sdpa"
+
+
+DTYPE = _pick_dtype()
+ATTN_IMPLEMENTATION = _pick_attn_implementation()
 
 parser = argparse.ArgumentParser(description="Train GRPO on paper instructions.")
 parser.add_argument("config_file")
@@ -85,7 +108,7 @@ buffer_size = config["training"].get("buffer_size", 500)
 num_repeats = config["training"].get("num_repeats", 5)
 eval_every_train_step = config["training"].get("eval_every_train_step", 8)
 std_normalize_advantages = config["training"].get("std_normalize_advantages", False)
-attn_implementation = "flash_attention_2"
+attn_implementation = ATTN_IMPLEMENTATION
 
 if n_rollouts < 2:
     raise ValueError("GRPO requires n_rollouts >= 2 so group advantages are non-zero.")
@@ -96,13 +119,13 @@ if from_sft:
     # Load the existing LoRA model directly
     llm = AutoPeftModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=DTYPE,
         is_trainable=True,
         attn_implementation=attn_implementation,
     )
 else:
     llm = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, attn_implementation=attn_implementation
+        model_name, torch_dtype=DTYPE, attn_implementation=attn_implementation
     )
 
     lora_config = LoraConfig(
@@ -118,14 +141,14 @@ if kld_weight > 0:
     if from_sft:
         ref_llm = AutoPeftModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=DTYPE,
             is_trainable=False,
             attn_implementation="sdpa",
         )
     else:
         ref_llm = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=DTYPE,
             attn_implementation="sdpa",
         )
     ref_llm.eval()
@@ -137,7 +160,9 @@ else:
 llm.print_trainable_parameters()
 llm = accelerator.prepare(llm)
 if ref_llm is not None:
-    ref_llm = accelerator.prepare(ref_llm)
+    # The reference model is frozen; keep it as a plain local module instead of
+    # wrapping it in DDP (no gradients need synchronizing).
+    ref_llm = ref_llm.to(accelerator.device)
 
 # Load the tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -165,9 +190,9 @@ test_dataloader = paper_dataset.get_dataloader(
 )
 
 optimizer = torch.optim.Adam(llm.parameters(), lr=learning_rate)
-optimizer, dataloader, test_dataloader = accelerator.prepare(
-    optimizer, dataloader, test_dataloader
-)
+# Keep the eval loader unsharded: only the main process runs inference, and we
+# want the full test set even when training uses DDP across several GPUs.
+optimizer, dataloader = accelerator.prepare(optimizer, dataloader)
 
 print("All loaded!!")
 
@@ -187,6 +212,8 @@ def inference(csv_suffix=""):
         max_new_tokens=max_new_tokens,
         output_path=eval_path,
         temperature=eval_temperature,
+        # Merging only this rank's replica would desync DDP weights.
+        merge_for_eval=accelerator.num_processes == 1,
     )
     summary = stats_df.describe().round(6).to_dict()
     with (logs_dir / f"eval_summary_{csv_suffix}.json").open("w") as f:

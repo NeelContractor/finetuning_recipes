@@ -1,7 +1,7 @@
 [project]
 name = "fine-tuning-recipes"
 version = "0.1.0"
-description = "End-to-end post-training recipes for small language models — CPT, SFT, DPO, ORPO, and reasoning."
+description = "End-to-end post-training recipes for small language models — CPT, SFT, DPO, GRPO, and reasoning."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [

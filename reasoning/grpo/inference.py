@@ -1,4 +1,3 @@
-import os
 import argparse
 from accelerate import Accelerator
 import paper_dataset
@@ -32,14 +31,6 @@ def extract_answer_fast(response):
         return response[think_end + len("</think>"):].strip()
     return response.strip()
 
-
-def extract_thinking_fast(response):
-    match = thinking_pattern.search(response)
-    if match:
-        return match.group(1)
-    else:
-        match = fallback_pattern.search(response)
-        return match.group(1).strip() if match else None
 
 def print_stats(scores_list, output_path=None):
     df = pd.DataFrame(scores_list)
@@ -83,6 +74,7 @@ def run_inference(
     max_new_tokens=200,
     output_path=None,
     temperature=EVAL_TEMPERATURE,
+    merge_for_eval=True,
 ):
     print("Starting inference...")
     total_scores = {}
@@ -90,14 +82,16 @@ def run_inference(
     # rollouts). Safe here: eval only generates + scores — no log_probs or
     # importance ratio — so the merged-vs-unmerged bf16 difference is irrelevant.
     # Guarded for the standalone __main__ path that loads a plain (non-PEFT) model.
-    merged_for_eval = hasattr(llm, "merge_adapter")
+    # Under DDP only rank 0 evaluates, so merging would desync its replica.
+    device = next(llm.parameters()).device
+    merged_for_eval = merge_for_eval and hasattr(llm, "merge_adapter")
     if merged_for_eval:
         llm.merge_adapter()
     for i, d in enumerate(tqdm(dataloader)):
 
         inputs = dict(
-            input_ids = d["input_ids"],
-            attention_mask = d["attention_mask"]
+            input_ids=d["input_ids"].to(device),
+            attention_mask=d["attention_mask"].to(device),
         )
         with torch.no_grad():
             outputs = generate_responses(
@@ -160,9 +154,14 @@ if __name__ == "__main__":
     # Load model with optimizations
     accelerator = Accelerator()
 
+    dtype = (
+        torch.bfloat16
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else (torch.float16 if torch.cuda.is_available() else torch.float32)
+    )
     llm = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

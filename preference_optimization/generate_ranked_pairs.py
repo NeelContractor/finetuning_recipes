@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from mlx_vlm_batch_outlines import batch_chat, load
 from pydantic import BaseModel, Field
 
-DEFAULT_MODEL = "mlx-community/Qwen3-0.6B-4bit"
+DEFAULT_MLX_MODEL = "mlx-community/Qwen3-0.6B-4bit"
+DEFAULT_TRANSFORMERS_MODEL = "Qwen/Qwen3-0.6B"
 
 SYSTEM_PROMPT = """You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.
 You are an expert in AI, deep learning, and machine learning research and its applications.
@@ -43,7 +44,10 @@ class RankingOutput(BaseModel):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generate ranked pairs for preference data using mlx-vlm-batch-outlines batched structured generation."
+        description=(
+            "Generate ranked pairs for preference data with a local model. "
+            "Uses MLX on Apple Silicon and Transformers/Outlines on CUDA (Kaggle)."
+        )
     )
     p.add_argument(
         "--input_file",
@@ -58,7 +62,34 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Defaults to <input>_ranked.jsonl",
     )
-    p.add_argument("--model_path", "-m", type=str, default=DEFAULT_MODEL)
+    p.add_argument(
+        "--backend",
+        choices=["auto", "mlx", "transformers"],
+        default="auto",
+        help="auto uses MLX on Apple Silicon, otherwise Transformers.",
+    )
+    p.add_argument(
+        "--model_path",
+        "-m",
+        type=str,
+        default=None,
+        help=(
+            "Local path or HF id. Defaults to mlx-community/Qwen3-0.6B-4bit "
+            "for MLX and Qwen/Qwen3-0.6B for Transformers."
+        ),
+    )
+    p.add_argument("--device", type=str, default="auto")
+    p.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+    )
+    p.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="4-bit quantization for Transformers backends (requires bitsandbytes).",
+    )
+    p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--max_tokens", type=int, default=512)
     p.add_argument("--limit", "-n", type=int, default=None)
     p.add_argument("--start_index", type=int, default=0)
@@ -120,6 +151,142 @@ def _extract_result(raw: Any) -> dict[str, Any] | None:
         return None
 
 
+def resolve_backend(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        try:
+            import mlx_vlm_batch_outlines  # noqa: F401
+
+            return "mlx"
+        except ImportError:
+            pass
+    return "transformers"
+
+
+def load_mlx_backend(model_path: str) -> Callable:
+    try:
+        from mlx_vlm_batch_outlines import batch_chat, load
+    except ImportError as exc:
+        raise SystemExit(
+            "MLX backend requested but mlx-vlm-batch-outlines is not installed. "
+            "On Kaggle/CUDA use --backend transformers instead."
+        ) from exc
+
+    model, processor = load(model_path)
+
+    def generate(conversations, output_type, max_tokens):
+        return batch_chat(
+            model,
+            processor,
+            conversations,
+            output_type=output_type,
+            max_tokens=max_tokens,
+        )
+
+    return generate
+
+
+def load_transformers_backend(
+    model_path: str,
+    device: str,
+    dtype: str,
+    load_in_4bit: bool,
+    trust_remote_code: bool,
+) -> Callable:
+    try:
+        import outlines
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise SystemExit(
+            "Transformers backend needs outlines, transformers, torch, and accelerate. "
+            "Install them with: pip install outlines transformers accelerate"
+        ) from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
+    model_kwargs = {
+        "trust_remote_code": trust_remote_code,
+        "device_map": device,
+        "low_cpu_mem_usage": True,
+    }
+
+    if load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise SystemExit(
+                "--load_in_4bit needs bitsandbytes. Install it with: pip install bitsandbytes"
+            ) from exc
+        compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        if dtype == "auto":
+            dtype = "float16" if torch.cuda.is_available() else "float32"
+        model_kwargs["torch_dtype"] = dtype_map[dtype]
+
+    hf_model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+    hf_model.eval()
+    model = outlines.from_transformers(hf_model, tokenizer)
+
+    def format_prompt(conversation: list[dict[str, str]]) -> str:
+        try:
+            return tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            rendered = "\n\n".join(
+                f"{message['role'].capitalize()}: {message['content']}"
+                for message in conversation
+            )
+            return rendered + "\n\nAssistant:"
+
+    def generate(conversations, output_type, max_tokens):
+        results = []
+        for conversation in conversations:
+            prompt = format_prompt(conversation)
+            results.append(
+                model(prompt, output_type, max_new_tokens=max_tokens)
+            )
+        return results
+
+    return generate
+
+
+def load_backend(args: argparse.Namespace) -> tuple[str, str, Callable]:
+    backend = resolve_backend(args.backend)
+    default_model = (
+        DEFAULT_MLX_MODEL if backend == "mlx" else DEFAULT_TRANSFORMERS_MODEL
+    )
+    model_path = args.model_path or default_model
+
+    print(f"Loading {backend} model from {model_path} …")
+    if backend == "mlx":
+        generate = load_mlx_backend(model_path)
+    else:
+        generate = load_transformers_backend(
+            model_path,
+            device=args.device,
+            dtype=args.dtype,
+            load_in_4bit=args.load_in_4bit,
+            trust_remote_code=args.trust_remote_code,
+        )
+    print("Model loaded.\n")
+    return backend, model_path, generate
+
+
 def main() -> None:
     args = parse_args()
 
@@ -128,9 +295,8 @@ def main() -> None:
     out_path = Path(args.output_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading model from {args.model_path} …")
-    model, processor = load(args.model_path)
-    print("Model loaded.\n")
+    backend, model_path, generate_batch = load_backend(args)
+    print(f"Backend: {backend} | model: {model_path}\n")
 
     with open(args.input_file, "r", encoding="utf-8") as f:
         records = [json.loads(line) for line in f]
@@ -167,12 +333,10 @@ def main() -> None:
         # --- Batch generation ------------------------------------------------
         batch_results: list[Any] = [None] * batch_size
         try:
-            raw_batch = batch_chat(
-                model,
-                processor,
+            raw_batch = generate_batch(
                 conversations,
-                output_type=RankingOutput,
-                max_tokens=args.max_tokens,
+                RankingOutput,
+                args.max_tokens,
             )
             # Normalise to a plain list
             if batch_size == 1 and not isinstance(raw_batch, list):
@@ -206,9 +370,7 @@ def main() -> None:
                 if ranking is not None:
                     break
                 try:
-                    single_raw = batch_chat(
-                        model,
-                        processor,
+                    single_raw = generate_batch(
                         [
                             [
                                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -220,8 +382,8 @@ def main() -> None:
                                 },
                             ]
                         ],
-                        output_type=RankingOutput,
-                        max_tokens=args.max_tokens,
+                        RankingOutput,
+                        args.max_tokens,
                     )
                     # normalise single-item wrapper
                     if not isinstance(single_raw, list):

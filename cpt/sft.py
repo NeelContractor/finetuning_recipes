@@ -4,13 +4,12 @@ try:
 except:
     print("cant import unsloth")
 import argparse
+import os
 import torch
 from datasets import load_dataset, interleave_datasets
 from trl import SFTTrainer, SFTConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig
-from transformers import TrainingArguments
-
 from transformers import EarlyStoppingCallback
 early_stopping_callback = EarlyStoppingCallback(
     early_stopping_patience = 3,     # How many steps we will wait if the eval loss doesn't decrease
@@ -38,6 +37,9 @@ def main():
     parser.add_argument("--mix", action="store_true", help="Mix in 20%% scientific_papers arxiv data to prevent forgetting")
     args = parser.parse_args()
 
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK") or "0"))
+
     # Load the dataset
     train_dataset = load_dataset("json", data_files=args.dataset_path, split="train")
     eval_dataset = load_dataset("json", data_files=args.test_dataset_path, split="train")
@@ -58,7 +60,7 @@ def main():
             probabilities=[0.8, 0.2],
             seed=SEED
         )
-        print(f"✅ Mixed dataset created. Your data: 80%, General arxiv: 20%")
+        print("✅ Mixed dataset created. Your data: 80%, General arxiv: 20%")
 
     # Word-level chunking
     if args.split_by_words > 0:
@@ -132,6 +134,7 @@ def main():
         logging_steps = 1,
         max_grad_norm = max_grad_norm,
         neftune_noise_alpha = neftune_noise_alpha,
+        ddp_find_unused_parameters = False,
     )
 
     common_training_args.update(dict(
@@ -231,13 +234,14 @@ def main():
     # Train
     trainer.train()
 
-    # Save the model
-    if torch.cuda.is_available():
-        model.save_pretrained(f"models/{args.output_model_id}/final")
-        tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
-    else:
-        trainer.model.save_pretrained(f"models/{args.output_model_id}/final")
-        tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
+    # Save the model (the Trainer only lets the main process write under DDP)
+    if trainer.is_world_process_zero():
+        if torch.cuda.is_available():
+            model.save_pretrained(f"models/{args.output_model_id}/final")
+            tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
+        else:
+            trainer.model.save_pretrained(f"models/{args.output_model_id}/final")
+            tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,8 @@
 import argparse
+import os
 import sys
+
+import torch
 
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import (
@@ -21,6 +24,8 @@ from trl import SFTConfig, SFTTrainer
 
 
 SEED = 3407
+# Avoid oversubscribing CPUs when each DDP rank spawns its own workers.
+WORKERS = 2 if int(os.environ.get("WORLD_SIZE") or "1") > 1 else 8
 
 SYSTEM_PROMPT = """You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.
 You are an expert in AI, deep learning, and machine learning research and its applications.
@@ -76,6 +81,9 @@ parser.add_argument("--variations", type=int, default=1)
 parser.add_argument("--learning_rate", "-lr", type=float, default=2e-4)
 
 args = parser.parse_args()
+
+if torch.cuda.is_available():
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK") or "0"))
 
 if args.conversation_extension == 1:
     args.variations = 1
@@ -200,7 +208,7 @@ trainer = SFTTrainer(
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
         logging_steps=10,
-        dataloader_num_workers=8,
+        dataloader_num_workers=WORKERS,
         optim="adamw_8bit",
         weight_decay=0.001,
         lr_scheduler_type="linear",
@@ -209,13 +217,14 @@ trainer = SFTTrainer(
         seed=SEED,
         max_length=args.max_seq_length,
         packing=True,
-        dataset_num_proc=8,
+        dataset_num_proc=WORKERS,
         save_strategy="steps",
         save_steps=50,
         save_total_limit=3,
         eval_strategy="steps",
         eval_steps=50,
-        bf16=True,
+        bf16=torch.cuda.is_bf16_supported(),
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         ddp_find_unused_parameters=False,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
@@ -237,6 +246,7 @@ trainer.add_callback(
 
 trainer.train()
 
-model.save_pretrained(f"models/{args.output_model_id}/final")
-tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
-print(f"Saved to models/{args.output_model_id}/final")
+if trainer.is_world_process_zero():
+    model.save_pretrained(f"models/{args.output_model_id}/final")
+    tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
+    print(f"Saved to models/{args.output_model_id}/final")

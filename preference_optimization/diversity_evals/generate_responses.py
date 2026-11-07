@@ -226,9 +226,14 @@ def main() -> None:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        dtype = (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        )
         model = AutoModelForCausalLM.from_pretrained(
             args.model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=dtype,
             device_map="auto",
         )
         model.eval()

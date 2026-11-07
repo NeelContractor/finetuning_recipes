@@ -1,5 +1,21 @@
 # Running the Full Fine-Tuning Pipeline on Google Colab (Free T4)
 
+> **Automated runner:** `cloud_train.py` wraps these steps (data prep → CPT →
+> SFT → DPO → GRPO) into one script. Recommended first run from the repo root:
+>
+> ```bash
+> python cloud_train.py --install --smoke
+> ```
+>
+> On Kaggle with **GPU T4 x2**, add `--num-gpus 2` to train with both GPUs via DDP:
+>
+> ```bash
+> python cloud_train.py --install --num-gpus 2 --smoke
+> ```
+>
+> Run `python cloud_train.py --help` for all options. The manual steps below are
+> still useful for debugging individual stages.
+
 This guide runs the **entire** pipeline — data prep → CPT → SFT → DPO/ORPO → reward model → GRPO — on a **free Google Colab T4 GPU (16 GB VRAM)**.
 
 Unlike your 8 GB M2 (where unsloth is CUDA-only and the SFT script won't run), the **T4 is CUDA**, so:

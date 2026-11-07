@@ -15,8 +15,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+import torch
 
 from unsloth import FastLanguageModel, PatchDPOTrainer, is_bfloat16_supported
 
@@ -36,6 +39,8 @@ from transformers import EarlyStoppingCallback
 from unsloth.chat_templates import get_chat_template
 
 SEED = 3407
+# Avoid oversubscribing CPUs when each DDP rank spawns its own workers.
+WORKERS = 2 if int(os.environ.get("WORLD_SIZE") or "1") > 1 else 8
 
 
 def ensure_trl_warning_state(model) -> None:
@@ -79,6 +84,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK") or "0"))
 
     print(f"Method: {args.method.upper()}")
     print(f"Base model: {args.base_model_id}")
@@ -141,7 +149,7 @@ def main() -> None:
                 num_train_epochs=args.epochs,
                 learning_rate=args.learning_rate,
                 logging_steps=10,
-                dataloader_num_workers=8,
+                dataloader_num_workers=WORKERS,
                 optim="adamw_8bit",
                 weight_decay=0.001,
                 lr_scheduler_type="linear",
@@ -155,6 +163,7 @@ def main() -> None:
                 eval_strategy="steps",
                 eval_steps=50,
                 load_best_model_at_end=True,
+                ddp_find_unused_parameters=False,
                 metric_for_best_model="eval_loss",
                 beta=args.beta,
                 max_length=args.max_seq_length,
@@ -181,7 +190,7 @@ def main() -> None:
                 num_train_epochs=args.epochs,
                 learning_rate=args.learning_rate,
                 logging_steps=10,
-                dataloader_num_workers=8,
+                dataloader_num_workers=WORKERS,
                 optim="adamw_8bit",
                 weight_decay=0.001,
                 lr_scheduler_type="linear",
@@ -195,6 +204,7 @@ def main() -> None:
                 eval_strategy="steps",
                 eval_steps=50,
                 load_best_model_at_end=True,
+                ddp_find_unused_parameters=False,
                 metric_for_best_model="eval_loss",
                 beta=args.beta,
                 max_length=args.max_seq_length,
@@ -212,9 +222,10 @@ def main() -> None:
     trainer.train()
 
     final_dir = f"{output_dir}/final"
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    print(f"Saved to {final_dir}")
+    if trainer.is_world_process_zero():
+        model.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+        print(f"Saved to {final_dir}")
 
 
 if __name__ == "__main__":

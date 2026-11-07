@@ -182,16 +182,35 @@ def score_doom_loop(completion: str) -> float:
     return DOOM_LOOP_PENALTY if _has_doom_loop(completion) else 0.0
 
 
+def _response_for_scoring(
+    completion: str,
+    reference: str,
+    require_think_format: bool,
+) -> str | None:
+    """Return the text the reward model should score, or None if invalid.
+
+    Training/eval rollouts use ``require_think_format=True`` so the reward is
+    gated on valid ``<think>...</think>`` tags. Offline baselines (e.g. the SFT
+    model) have no think block, so they pass ``require_think_format=False`` and
+    the whole completion is scored.
+    """
+    if not completion or not reference:
+        return None
+    if require_think_format and not _has_expected_format(completion):
+        return None
+    _, response, _ = _extract_think_content(completion)
+    response = response or ("" if require_think_format else completion)
+    return response.strip() or None
+
+
 def score_neuraltxt(
     completion: str,
     reference: str,
     reward_model: NeuralTxtReward | None = None,
+    require_think_format: bool = True,
 ) -> float:
-    if not completion or not reference or not _has_expected_format(completion):
-        return 0.0
-
-    _, response, _ = _extract_think_content(completion)
-    if not response:
+    response = _response_for_scoring(completion, reference, require_think_format)
+    if response is None:
         return 0.0
 
     rm = reward_model or _get_reward_model()
@@ -202,6 +221,7 @@ def score_neuraltxt_batch(
     completions: list[str],
     references: list[str],
     reward_model: NeuralTxtReward | None = None,
+    require_think_format: bool = True,
 ) -> list[float]:
     """Score many completions with a single batched reward-model forward.
 
@@ -214,14 +234,16 @@ def score_neuraltxt_batch(
     valid_references: list[str] = []
 
     for index, (completion, reference) in enumerate(zip(completions, references)):
-        if not completion or not reference or not _has_expected_format(completion):
-            continue
-        _, response, _ = _extract_think_content(completion)
-        if not response:
+        response = _response_for_scoring(
+            completion,
+            str(reference or ""),
+            require_think_format,
+        )
+        if response is None:
             continue
         valid_indices.append(index)
         valid_responses.append(response)
-        valid_references.append(reference)
+        valid_references.append(str(reference or ""))
 
     if not valid_responses:
         return scores
@@ -244,6 +266,7 @@ def score_neuraltxt_batch(
 def score_length_penalty_batch(
     completions: list[str],
     references: list[str],
+    require_think_format: bool = True,
 ) -> list[float]:
     """Flat hard-cap length penalty for each completion (values <= 0).
 
@@ -255,12 +278,14 @@ def score_length_penalty_batch(
     """
     penalties = [0.0] * len(completions)
     for i, (completion, reference) in enumerate(zip(completions, references)):
-        if not completion or not reference or not _has_expected_format(completion):
+        response = _response_for_scoring(
+            completion,
+            str(reference or ""),
+            require_think_format,
+        )
+        if response is None:
             continue
-        _, response, _ = _extract_think_content(completion)
-        if not response:
-            continue
-        if _word_count(response) > _length_cap(reference):
+        if _word_count(response) > _length_cap(str(reference or "")):
             penalties[i] = LENGTH_OVERAGE_PENALTY
     return penalties
 
@@ -270,34 +295,55 @@ def score_completions(
     references: list[str],
     reward_weights: dict[str, float] | None = None,
     reward_model: NeuralTxtReward | None = None,
+    require_think_format: bool = True,
+    include_format_rewards: bool = True,
 ) -> RewardBatch:
+    """Score completions with the training reward.
+
+    ``require_think_format`` gates the semantic/length terms on a valid think
+    block (training rollouts) or scores the whole completion (SFT baselines).
+    ``include_format_rewards`` controls whether the think/datatype/schema
+    components are emitted; set it False when the model has no reasoning format
+    so those components contribute 0 instead of a spurious penalty.
+    """
     raw_neuraltxt = np.array(
         score_neuraltxt_batch(
             completions,
             [str(reference or "") for reference in references],
             reward_model=reward_model,
+            require_think_format=require_think_format,
         ),
         dtype=np.float32,
     )
-    components = {
-        "think_format_reward": np.array(
+    if include_format_rewards:
+        think_format = np.array(
             [score_think_format(completion) for completion in completions],
             dtype=np.float32,
-        ),
-        "output_datatype_reward": np.array(
+        )
+        output_datatype = np.array(
             [
                 score_output_datatype(completion, str(reference or ""))
                 for completion, reference in zip(completions, references)
             ],
             dtype=np.float32,
-        ),
-        "output_schema_reward": np.array(
+        )
+        output_schema = np.array(
             [
                 score_output_schema(completion, str(reference or ""))
                 for completion, reference in zip(completions, references)
             ],
             dtype=np.float32,
-        ),
+        )
+    else:
+        zeros = np.zeros(len(completions), dtype=np.float32)
+        think_format = zeros.copy()
+        output_datatype = zeros.copy()
+        output_schema = zeros.copy()
+
+    components = {
+        "think_format_reward": think_format,
+        "output_datatype_reward": output_datatype,
+        "output_schema_reward": output_schema,
         "doom_loop_reward": np.array(
             [score_doom_loop(completion) for completion in completions],
             dtype=np.float32,
@@ -307,6 +353,7 @@ def score_completions(
             score_length_penalty_batch(
                 completions,
                 [str(reference or "") for reference in references],
+                require_think_format=require_think_format,
             ),
             dtype=np.float32,
         ),
@@ -350,6 +397,8 @@ def diagnose_completion(completion: str, reference: str) -> dict[str, Any]:
 def score_rollouts(
     rows: list[dict],
     reward_model: NeuralTxtReward | None = None,
+    require_think_format: bool = True,
+    include_format_rewards: bool = True,
 ) -> list[dict]:
     """Score offline rollout rows with the SAME reward used in training.
 
@@ -360,7 +409,13 @@ def score_rollouts(
     """
     completions = [row["completion"] for row in rows]
     references = [str(row.get("reference") or "") for row in rows]
-    reward_batch = score_completions(completions, references, reward_model=reward_model)
+    reward_batch = score_completions(
+        completions,
+        references,
+        reward_model=reward_model,
+        require_think_format=require_think_format,
+        include_format_rewards=include_format_rewards,
+    )
 
     results = []
     for index, row in enumerate(rows):

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
+from huggingface_hub import hf_hub_download
 from pathlib import Path
 
 BASE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -29,18 +30,25 @@ def load_reward_model(path):
         model, tokenizer = load_reward_model("paperbd/neuraltxt-reward-22M")
         score = model.score("reference text", "candidate text")
     """
-    path = Path(path).resolve()
+    raw_source = str(path)
+    local_path = Path(raw_source).expanduser()
+    is_local = local_path.exists()
+    source = str(local_path) if is_local else raw_source
 
     # Tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained(str(path))
+        tokenizer = AutoTokenizer.from_pretrained(source)
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
 
-    # Encoder
-    if (path / "model.safetensors").exists():
-        encoder = AutoModel.from_pretrained(str(path))
-    else:
+    # Encoder: load the local checkpoint / HF repo, falling back to the base
+    # encoder only when the saved encoder weights are absent.
+    try:
+        if is_local and not (local_path / "model.safetensors").exists():
+            encoder = AutoModel.from_pretrained(BASE_MODEL)
+        else:
+            encoder = AutoModel.from_pretrained(source)
+    except Exception:
         encoder = AutoModel.from_pretrained(BASE_MODEL)
 
     # Head (~3KB)
@@ -48,11 +56,26 @@ def load_reward_model(path):
     # heads trained with mean+max concat pooling are 2x hidden_size wide.
     dim = EMBED_DIM or encoder.config.hidden_size
     head_state = None
-    for fname in ["head_weights.pt", "head_weights.bin"]:
-        hp = path / fname
-        if hp.exists():
-            head_state = torch.load(str(hp), weights_only=True, map_location="cpu")
+    candidates = ["head_weights.pt", "head_weights.bin"]
+    if is_local:
+        for fname in candidates:
+            hp = local_path / fname
+            if hp.exists():
+                head_state = torch.load(str(hp), weights_only=True, map_location="cpu")
+                break
+    else:
+        for fname in candidates:
+            try:
+                hp = hf_hub_download(repo_id=source, filename=fname)
+            except Exception:
+                continue
+            head_state = torch.load(hp, weights_only=True, map_location="cpu")
             break
+    if head_state is None:
+        raise FileNotFoundError(
+            f"No head_weights.pt/.bin found for reward model {source!r}. "
+            "This loader expects a trained reward-model directory or HF repo."
+        )
     pool_fn = mean_pool
     if head_state is not None:
         in_dim = head_state["1.weight"].shape[1]

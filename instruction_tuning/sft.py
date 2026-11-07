@@ -4,6 +4,18 @@ import sys
 
 import torch
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from checkpointing import (
+    add_checkpoint_args,
+    hub_repo_from_args,
+    make_hub_checkpoint_callback,
+    resolve_resume_checkpoint,
+    upload_final_model,
+)
+
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template, to_sharegpt, standardize_data_formats, train_on_responses_only
 
@@ -37,11 +49,20 @@ parser.add_argument("--load_in_4bit", action="store_true", default=True)
 parser.add_argument("--conversation_extension", type=int, default=1)
 parser.add_argument("--variations", type=int, default=1)
 parser.add_argument("--learning_rate", "-lr", type=float, default=2e-4) 
+add_checkpoint_args(parser)
 
 args = parser.parse_args()
 
 if torch.cuda.is_available():
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK") or "0"))
+
+output_dir = f"models/{args.output_model_id}"
+resume_checkpoint = resolve_resume_checkpoint(
+    output_dir,
+    explicit=args.resume_from_checkpoint,
+    auto=args.resume,
+)
+hub_repo = hub_repo_from_args(args)
 
 if args.conversation_extension == 1:
     args.variations = 1
@@ -123,7 +144,7 @@ trainer = SFTTrainer(
     train_dataset = train_dataset,
     eval_dataset = val_dataset,
     args = SFTConfig(
-        output_dir = f"models/{args.output_model_id}",
+        output_dir = output_dir,
         dataset_text_field = "text",
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -165,10 +186,27 @@ trainer = train_on_responses_only(
 trainer.add_callback(
     EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.0)
 )
+if hub_repo:
+    trainer.add_callback(
+        make_hub_checkpoint_callback(
+            repo_id=hub_repo,
+            path_prefix=args.output_model_id,
+            private=args.hub_private,
+            upload_every=args.hub_upload_every_saves,
+        )
+    )
 
-trainer.train()
+trainer.train(resume_from_checkpoint=resume_checkpoint)
 
+final_dir = f"{output_dir}/final"
 if trainer.is_world_process_zero():
-    model.save_pretrained(f"models/{args.output_model_id}/final")
-    tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
-    print(f"Saved to models/{args.output_model_id}/final")
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    print(f"Saved to {final_dir}")
+    if hub_repo:
+        upload_final_model(
+            output_dir,
+            hub_repo,
+            args.output_model_id,
+            private=args.hub_private,
+        )

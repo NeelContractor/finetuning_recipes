@@ -34,6 +34,14 @@ except ModuleNotFoundError:
     from chat_formatting import normalize_explicit_preference_example
     from trl_compat import patch_trl_optional_dependency_checks
 
+from checkpointing import (
+    add_checkpoint_args,
+    hub_repo_from_args,
+    make_hub_checkpoint_callback,
+    resolve_resume_checkpoint,
+    upload_final_model,
+)
+
 from datasets import load_dataset
 from transformers import EarlyStoppingCallback
 from unsloth.chat_templates import get_chat_template
@@ -79,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--learning_rate", "-lr", type=float, default=2e-4)
     p.add_argument("--beta", type=float, default=0.1, help="DPO/ORPO beta hyperparameter.")
     p.add_argument("--max_prompt_length", type=int, default=1536)
+    add_checkpoint_args(p)
     return p.parse_args()
 
 
@@ -128,6 +137,12 @@ def main() -> None:
     val_dataset = split["test"]
 
     output_dir = f"models/{args.output_model_id}"
+    resume_checkpoint = resolve_resume_checkpoint(
+        output_dir,
+        explicit=args.resume_from_checkpoint,
+        auto=args.resume,
+    )
+    hub_repo = hub_repo_from_args(args)
 
     ensure_trl_warning_state(model)
 
@@ -218,14 +233,30 @@ def main() -> None:
     trainer.add_callback(
         EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.0)
     )
+    if hub_repo:
+        trainer.add_callback(
+            make_hub_checkpoint_callback(
+                repo_id=hub_repo,
+                path_prefix=args.output_model_id,
+                private=args.hub_private,
+                upload_every=args.hub_upload_every_saves,
+            )
+        )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     final_dir = f"{output_dir}/final"
     if trainer.is_world_process_zero():
         model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
         print(f"Saved to {final_dir}")
+        if hub_repo:
+            upload_final_model(
+                output_dir,
+                hub_repo,
+                args.output_model_id,
+                private=args.hub_private,
+            )
 
 
 if __name__ == "__main__":

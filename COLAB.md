@@ -13,6 +13,21 @@
 > python cloud_train.py --install --num-gpus 2 --smoke
 > ```
 >
+> Resume after a disconnect and upload checkpoints to the Hugging Face Hub:
+>
+> ```bash
+> export HF_TOKEN="hf_..."
+> export HF_CHECKPOINT_REPO="your-username/finetuning-checkpoints"
+>
+> python cloud_train.py --install --num-gpus 2 \
+>   --resume \
+>   --push-to-hub --hub-repo "$HF_CHECKPOINT_REPO"
+> ```
+>
+> `--resume` auto-detects the latest checkpoint in each stage's output directory.
+> `--hub-upload-every-saves 5` throttles uploads if Hub syncing slows training.
+> Use `--no-hub-private` only if you intentionally want a public checkpoint repo.
+>
 > Run `python cloud_train.py --help` for all options. The manual steps below are
 > still useful for debugging individual stages.
 
@@ -23,7 +38,7 @@ Unlike your 8 GB M2 (where unsloth is CUDA-only and the SFT script won't run), t
 - ✅ All 5 training scripts take the **Unsloth CUDA path** automatically (`torch.cuda.is_available()` → `True`)
 - ✅ The unconditional `from unsloth import ...` at the top of each script works fine
 - ✅ `load_in_4bit=True` and `optim="adamw_8bit"` actually activate
-- ✅ Flash Attention and fp16 mixed precision work
+- ✅ fp16 mixed precision works; T4 (Turing) uses SDPA because Flash Attention v2 needs Ampere+
 
 Your tiny 0.6B model (`Qwen/Qwen3-0.6B`) is trivially small for 16 GB VRAM. The same scripts run **verbatim** from the repo — the only new work is **Colab-specific setup** (install unsloth, mount Drive, adjust for the ephemeral VM, size the datasets to fit the session).
 
@@ -34,6 +49,7 @@ Your tiny 0.6B model (`Qwen/Qwen3-0.6B`) is trivially small for 16 GB VRAM. The 
 1. **The VM is disposable.** Every file on the VM disk (`/content/...`) is **deleted when the session ends** (cap ~12 h, idle timeout ~90 min). You **must**:
    - Mount Google Drive and do all project work under `/content/drive/MyDrive/...`
    - Copy each stage's `models/.../final` checkpoint to Drive as soon as training finishes
+   - Prefer `--resume` on restart and `--push-to-hub` for an off-Drive backup
 2. **unsloth is not preinstalled.** Install it in a cell at the start of the runtime (one time).
 3. **Free tier limits:** no terminal/background execution (Pro+ only), GPU not guaranteed at peak times (may get a K80 12GB — still fine for 0.6B). Request T4 during off-peak hours (late night US).
 
@@ -96,13 +112,26 @@ If you have a git repo (recommended so you can track edits):
 
 > If you made local edits (like the README / model IDs), the cleanest path is to **commit + push those first**, then clone here. Or upload your whole `fine_tuning/` folder to Drive via the Files panel and use that as the working dir.
 
-### 3b. (Optional) Create the `.env` with your OpenRouter key
+### 3b. (Optional) Set API keys and the HF checkpoint repo
 
-Only needed for the **LLM-judge** scripts. The free judge model is already the default in the code, and the key can also be set directly in Python below. Simplest in Colab:
+OpenRouter is only needed for the **LLM-judge** scripts. The free judge model is already the default in the code.
+
+`HF_TOKEN` is needed only for `--push-to-hub`; create a **write** token at
+<https://huggingface.co/settings/tokens>. `HF_CHECKPOINT_REPO` can be any new
+repo id (it is created automatically as private).
 
 ```python
 import os
-os.environ["OPENROUTER_API_KEY"] = "sk-or-..."   # paste your key (never commit it)
+os.environ["OPENROUTER_API_KEY"] = "sk-or-..."          # optional judge key
+os.environ["HF_TOKEN"] = "hf_..."                       # optional upload token
+os.environ["HF_CHECKPOINT_REPO"] = "your-username/finetuning-checkpoints"
+```
+
+Or, if the notebook is using `%%bash` cells, export them there:
+
+```bash
+export HF_TOKEN="hf_..."
+export HF_CHECKPOINT_REPO="your-username/finetuning-checkpoints"
 ```
 
 ---
@@ -123,9 +152,66 @@ Every `models/...` output therefore lands in `/content/drive/MyDrive/fine_tuning
 
 ---
 
+## 4b. Checkpointing, resume, and HF upload
+
+Every training stage now accepts the same checkpoint flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--resume` | Auto-resume from the latest checkpoint in `models/<run>/`. If none exists, start fresh. |
+| `--resume_from_checkpoint PATH` | Resume from an explicit checkpoint directory. Overrides `--resume`. |
+| `--push-to-hub` | Upload checkpoints and the final model to `--hub-repo`. |
+| `--hub-repo USER/REPO` | Target HF repo. Defaults to `HF_CHECKPOINT_REPO`. |
+| `--hub-private` / `--no-hub-private` | Private by default; use `--no-hub-private` for a public repo. |
+| `--hub-upload-every-saves N` | Upload every Nth save (default `1`). Use `5` or `10` if uploads slow training. |
+
+Checkpoint layouts:
+
+- Trainer stages (CPT/SFT/DPO/SFT warm-up): `models/<run>/checkpoint-<step>/`
+- Final model: `models/<run>/final`
+- GRPO: `models/<run>/llm`, `models/<run>/llm_best_<n>`, plus `optimizer.pt` and `training_state.json`
+- HF repo: `<repo>/<run>/checkpoint-<step>`, `<repo>/<run>/final`, and `<repo>/<run>/llm*`
+
+Example: resume every stage from Drive and back up to HF:
+
+```python
+%%bash
+cd /content/drive/MyDrive/fine_tuning
+export HF_TOKEN="hf_..."
+export HF_CHECKPOINT_REPO="your-username/finetuning-checkpoints"
+
+python cloud_train.py --num-gpus 2 \
+  --resume \
+  --push-to-hub --hub-repo "$HF_CHECKPOINT_REPO" \
+  --hub-upload-every-saves 5
+```
+
+To resume one stage manually, point at its checkpoint explicitly:
+
+```bash
+python cpt/sft.py ... \
+  --resume_from_checkpoint models/cpt_arxiv_qwen06/checkpoint-500
+```
+
+> Checkpoints stay local on Drive **and** are uploaded to the Hub only when
+> `--push-to-hub` is set. Without it, training still writes normal local
+> checkpoints and `--resume` still works.
+
+---
+
 ## 5. Full pipeline (step by step, copy-paste per cell)
 
 Each numbered block below is a single Colab cell. Model = `Qwen/Qwen3-0.6B`. Runs are sized to fit comfortably inside a single free session.
+
+> All stage commands include `--resume` (safe on a fresh run). To also upload
+> checkpoints/finals, append:
+>
+> ```bash
+> --push-to-hub --hub-repo "$HF_CHECKPOINT_REPO" --hub-upload-every-saves 5
+> ```
+>
+> `HF_CHECKPOINT_REPO` and `HF_TOKEN` come from Step 3b. Omit the upload flags
+> if you only want local Drive checkpoints.
 
 ### Step 5.1 — Prepare CPT data (arXiv papers)
 
@@ -163,7 +249,8 @@ python cpt/sft.py \
   --test_dataset_path cpt_val_dataset_50.jsonl \
   --max_seq_length 512 \
   --batch_size 8 \
-  --epochs 10
+  --epochs 10 \
+  --resume
 ```
 
 Replace `cpt_train_dataset_N.jsonl` with the exact filename printed in 5.1.
@@ -204,7 +291,8 @@ python instruction_tuning/sft.py \
   --max_seq_length 1024 \
   --batch_size 4 \
   --grad_accum 8 \
-  --epochs 3
+  --epochs 3 \
+  --resume
 ```
 
 > **Dataset size warning:** `paper_instructions_300K-v1` is 300K rows — too big for one free session (and way more than a 0.6B learning model needs). **Sub-sample it** in the cell first, then pass your own dataset:
@@ -275,7 +363,7 @@ python preference_optimization/diversity_evals/generate_responses.py \
 
 Output: a `*_4r_temp*.jsonl` file (e.g. `pref_dataset.jsonl`).
 
-**5.4b. Rank the responses** (either OpenRouter with the free judge, or the transformers/outlines path):
+**5.4b. Rank the responses** (either OpenRouter with the free judge, or the local transformers/outlines path):
 
 ```python
 # Option A — OpenRouter API (free judge model, needs OPENROUTER_API_KEY)
@@ -283,12 +371,17 @@ Output: a `*_4r_temp*.jsonl` file (e.g. `pref_dataset.jsonl`).
 cd /content/drive/MyDrive/fine_tuning
 python preference_optimization/generate_ranked_pairs_openai.py -i pref_dataset.jsonl
 
-# Option B — local (outlines structured gen, transformers on T4)
+# Option B — local transformers/outlines path on T4 (no API key)
 cd /content/drive/MyDrive/fine_tuning
-python preference_optimization/generate_ranked_pairs.py -i pref_dataset.jsonl
+python preference_optimization/generate_ranked_pairs.py \
+  -i pref_dataset.jsonl \
+  --backend transformers \
+  --load_in_4bit
 ```
 
-Both write `<input>_ranked.jsonl`.
+The local ranker supports `--backend auto|mlx|transformers`; `auto` picks MLX
+when available and Transformers otherwise. Both options write
+`<input>_ranked.jsonl`.
 
 **5.4c. Convert to pairwise DPO data:**
 
@@ -308,8 +401,18 @@ python preference_optimization/train_preference.py \
   --base_model_id models/instruction_tuned_qwen06/final \
   --output_model_id dpo_qwen06 \
   --dataset pref_dataset_ranked_dpo.jsonl \
-  --max_seq_length 1024 --batch_size 4 --grad_accum 8 --epochs 3
+  --max_seq_length 1024 --batch_size 4 --grad_accum 8 --epochs 3 \
+  --resume
 ```
+
+> The orchestrated runner can also rank pairs locally without OpenRouter:
+>
+> ```bash
+> python cloud_train.py --stages dpo \
+>   --dpo-source generate --dpo-ranker local \
+>   --dpo-ranker-model Qwen/Qwen2.5-3B-Instruct --dpo-ranker-load-in-4bit \
+>   --resume
+> ```
 
 ---
 
@@ -345,7 +448,8 @@ python reasoning/sft_warmup.py \
   --dataset paperbd/paper_instructions_300K-v1 \
   --dataset_config reasoning \
   --output_model_id reasoning_warmup_qwen06 \
-  --max_seq_length 1024 --batch_size 4 --grad_accum 8 --epochs 3
+  --max_seq_length 1024 --batch_size 4 --grad_accum 8 --epochs 3 \
+  --resume
 ```
 
 > Sub-sample the reasoning dataset too (see Step 5.3) — pass a small local JSONL and lower `--epochs`.
@@ -376,10 +480,10 @@ data:
 ```python
 %%bash
 cd /content/drive/MyDrive/fine_tuning
-python reasoning/grpo/train.py reasoning/grpo/config.yaml -o reasoning_qwen06
+python reasoning/grpo/train.py reasoning/grpo/config.yaml -o reasoning_qwen06 --resume
 ```
 
-> GRPO is the heaviest stage and the most likely to exceed the free session. Keep the rollout size small and lower `train_data_size` / `num_epochs` in the config if it's too slow. If it won't fit in one session, split it and rely on saved checkpoints.
+> GRPO is the heaviest stage and the most likely to exceed the free session. Keep the rollout size small and lower `train_data_size` / `num_epochs` in the config if it's too slow. If it won't fit in one session, rerun with `--resume`; it restores the latest `models/reasoning_qwen06/llm*` checkpoint plus `optimizer.pt` and `training_state.json`.
 
 ---
 
@@ -398,8 +502,19 @@ Everything under `/content/drive/MyDrive/fine_tuning/` persists. **On your next 
 1. `drive.mount(...)`
 2. the `!pip install unsloth ...` cell
 3. `os.chdir("/content/drive/MyDrive/fine_tuning")`
+4. Re-export `HF_TOKEN` / `HF_CHECKPOINT_REPO` if uploading to the Hub
 
-then continue from the next stage.
+Then rerun the same stage with `--resume`; it finds the newest local
+`checkpoint-*` (or GRPO `llm*`) automatically. To resume from a specific
+checkpoint:
+
+```bash
+python instruction_tuning/sft.py ... \
+  --resume_from_checkpoint models/instruction_tuned_qwen06/checkpoint-500
+```
+
+If the session was lost and Drive is unavailable, download the checkpoint folder
+from the HF repo and pass its local path to `--resume_from_checkpoint`.
 
 ---
 
@@ -409,7 +524,11 @@ then continue from the next stage.
 |---------|-----|
 | `CUDA out of memory` | Raise `grad_accum`, lower `--batch_size` to 2; ensure 4-bit is active (CUDA path). 0.6B rarely hits this. |
 | GPU is K80, not T4 (12 GB) | Reconnect Runtime → "Change runtime type" → T4 (do this off-peak / late night US). Still fine for 0.6B. |
-| Session disconnected mid-training | Re-run setup cells, continue from last Drive checkpoint. Accept the 12 h cap. |
+| Session disconnected mid-training | Re-run setup cells, then rerun the same stage with `--resume`. Accept the 12 h cap. |
+| `--resume` starts fresh | Check `models/<run>/checkpoint-*` exists; use `--resume_from_checkpoint PATH` to be explicit. |
+| HF upload fails with 401/403 | `HF_TOKEN` is missing or lacks write access. Create a write token and export it again. |
+| Hub uploads slow training | Use `--hub-upload-every-saves 5` or `10`, or omit `--push-to-hub` and rely on Drive. |
+| Checkpoint disk fills up | Delete old `models/<run>/checkpoint-*` dirs after confirming the Hub copy; keep the latest. |
 | `unsloth` import/version error | `!pip uninstall -y unsloth transformers trl` then `!pip install unsloth` to rebuild a compatible set. |
 | `datasets==3.6` conflicts with unsloth | Let unsloth's `datasets` version win; re-run the other `pip install` lines only if a package errors. |
 | LLM-judge 429 (rate limit) | Free model is rate-limited (~20 req/min). Add `--limit` / smaller `-n`, or wait between runs. |
@@ -430,6 +549,7 @@ Data prep → CPT → (merge) → SFT → (merge) → DPO/ORPO → Reward → GR
 - Install unsloth once per runtime, re-run after each restart
 - Keep data small (sub-sample) so each stage fits in a ~12 h session
 - Save/verify checkpoints on Drive after every stage
+- Use `--resume` after every disconnect; use `--push-to-hub` for an off-Drive backup
 - Off-peak hours → more reliable T4 allocation
 
 This pipeline now runs end-to-end on the free T4 without any of the Mac/MLX workarounds.

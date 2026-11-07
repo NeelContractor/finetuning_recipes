@@ -5,12 +5,27 @@ except:
     print("cant import unsloth")
 import argparse
 import os
+import sys
+from pathlib import Path
+
 import torch
 from datasets import load_dataset, interleave_datasets
 from trl import SFTTrainer, SFTConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig
 from transformers import EarlyStoppingCallback
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from checkpointing import (
+    add_checkpoint_args,
+    hub_repo_from_args,
+    make_hub_checkpoint_callback,
+    resolve_resume_checkpoint,
+    upload_final_model,
+)
 early_stopping_callback = EarlyStoppingCallback(
     early_stopping_patience = 3,     # How many steps we will wait if the eval loss doesn't decrease
                                      # For example the loss might increase, but decrease after 3 steps
@@ -35,10 +50,19 @@ def main():
     parser.add_argument("--batch_size", "-bs", type=int, default=32)
     parser.add_argument("--epochs", "-e", type=int, default=10)
     parser.add_argument("--mix", action="store_true", help="Mix in 20%% scientific_papers arxiv data to prevent forgetting")
+    add_checkpoint_args(parser)
     args = parser.parse_args()
 
     if torch.cuda.is_available():
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK") or "0"))
+
+    output_dir = f"models/{args.output_model_id}"
+    resume_checkpoint = resolve_resume_checkpoint(
+        output_dir,
+        explicit=args.resume_from_checkpoint,
+        auto=args.resume,
+    )
+    hub_repo = hub_repo_from_args(args)
 
     # Load the dataset
     train_dataset = load_dataset("json", data_files=args.dataset_path, split="train")
@@ -118,7 +142,7 @@ def main():
 
     # Common Training Config
     common_training_args = dict(
-        output_dir=f"models/{args.output_model_id}",
+        output_dir=output_dir,
         save_total_limit=10,
         per_device_train_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
@@ -231,17 +255,35 @@ def main():
         )
 
     trainer.add_callback(early_stopping_callback)
-    # Train
-    trainer.train()
+    if hub_repo:
+        trainer.add_callback(
+            make_hub_checkpoint_callback(
+                repo_id=hub_repo,
+                path_prefix=args.output_model_id,
+                private=args.hub_private,
+                upload_every=args.hub_upload_every_saves,
+            )
+        )
+
+    # Train (optionally resuming from a checkpoint)
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     # Save the model (the Trainer only lets the main process write under DDP)
+    final_dir = f"{output_dir}/final"
     if trainer.is_world_process_zero():
         if torch.cuda.is_available():
-            model.save_pretrained(f"models/{args.output_model_id}/final")
-            tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
+            model.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
         else:
-            trainer.model.save_pretrained(f"models/{args.output_model_id}/final")
-            tokenizer.save_pretrained(f"models/{args.output_model_id}/final")
+            trainer.model.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
+        if hub_repo:
+            upload_final_model(
+                output_dir,
+                hub_repo,
+                args.output_model_id,
+                private=args.hub_private,
+            )
 
 if __name__ == "__main__":
     main()

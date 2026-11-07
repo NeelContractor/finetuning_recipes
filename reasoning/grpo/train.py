@@ -4,6 +4,8 @@ from transformers import (
 )
 import argparse
 import json
+import sys
+
 import paper_dataset
 import torch
 from grpo_utils import (
@@ -25,6 +27,18 @@ from tqdm import tqdm
 import math
 import gc
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from checkpointing import (
+    add_checkpoint_args,
+    find_latest_model_dir,
+    hub_repo_from_args,
+    push_folder_to_hub,
+    resolve_resume_checkpoint,
+)
 
 try:
     from reasoning.env import score_completions
@@ -64,12 +78,21 @@ parser.add_argument(
     required=True,
     help="Output model id under models/.",
 )
+add_checkpoint_args(parser)
 args = parser.parse_args()
 
 config_file = args.config_file
 output_model_dir = Path("models") / args.output_model_id
 logs_dir = output_model_dir / "logs"
 logs_dir.mkdir(parents=True, exist_ok=True)
+
+resume_checkpoint = resolve_resume_checkpoint(
+    output_model_dir,
+    explicit=args.resume_from_checkpoint,
+    auto=args.resume,
+    finder=find_latest_model_dir,
+)
+hub_repo = hub_repo_from_args(args)
 
 # Load configuration
 with open(config_file, "r") as f:
@@ -104,6 +127,12 @@ temperature = config["training"]["temperature"]
 # checkpoint-selection signal, so it wants low variance, not exploration.
 eval_temperature = config["training"].get("eval_temperature", 0.2)
 from_sft = config["model"].get("from_sft", False)
+if resume_checkpoint:
+    resume_path = Path(resume_checkpoint)
+    model_name = str(resume_path)
+    # GRPO saves PEFT adapters as ``llm*``; use the PEFT loader for those.
+    from_sft = (resume_path / "adapter_config.json").exists()
+    print(f"[resume] GRPO model: {model_name} (from_sft={from_sft})")
 buffer_size = config["training"].get("buffer_size", 500)
 num_repeats = config["training"].get("num_repeats", 5)
 eval_every_train_step = config["training"].get("eval_every_train_step", 8)
@@ -190,17 +219,59 @@ test_dataloader = paper_dataset.get_dataloader(
 )
 
 optimizer = torch.optim.Adam(llm.parameters(), lr=learning_rate)
+if resume_checkpoint:
+    optimizer_path = Path(resume_checkpoint) / "optimizer.pt"
+    if optimizer_path.exists():
+        try:
+            optimizer.load_state_dict(
+                torch.load(optimizer_path, map_location="cpu", weights_only=False)
+            )
+            print(f"[resume] Loaded optimizer state from {optimizer_path}")
+        except Exception as exc:
+            print(f"[resume] WARNING: could not load optimizer state: {exc}")
 # Keep the eval loader unsharded: only the main process runs inference, and we
 # want the full test set even when training uses DDP across several GPUs.
 optimizer, dataloader = accelerator.prepare(optimizer, dataloader)
 
 print("All loaded!!")
 
-def save_model(postfix=""):
+def save_model(postfix="", epoch=0, batch_idx=-1, event=0, step=0):
     unwrapped_llm = accelerator.unwrap_model(llm)
     model_dir = output_model_dir / f"llm{postfix}"
     unwrapped_llm.save_pretrained(model_dir)
     tokenizer.save_pretrained(model_dir)
+
+    # Persist enough state to resume this GRPO run after a Kaggle restart.
+    (model_dir / "training_state.json").write_text(
+        json.dumps(
+            {
+                "epoch": epoch,
+                "batch_idx": batch_idx,
+                "event": event,
+                "step": step,
+            }
+        )
+    )
+    try:
+        torch.save(optimizer.state_dict(), model_dir / "optimizer.pt")
+    except Exception as exc:
+        print(f"[checkpoint] WARNING: could not save optimizer state: {exc}")
+
+    if hub_repo and (
+        args.hub_upload_every_saves <= 1
+        or event % args.hub_upload_every_saves == 0
+    ):
+        target = f"{args.output_model_id}/{model_dir.name}"
+        try:
+            push_folder_to_hub(
+                model_dir,
+                hub_repo,
+                path_in_repo=target,
+                private=args.hub_private,
+                commit_message=f"Upload {target}",
+            )
+        except Exception as exc:
+            print(f"[hub] WARNING: failed to upload {model_dir}: {exc}")
 
 
 def inference(csv_suffix=""):
@@ -340,10 +411,28 @@ class GRPO:
         optimizer.zero_grad()
         i = 0
         num_train_events = 0
+        start_epoch = 0
+        skip_until_batch = -1
         best_model_id = 0
         best_inference_score = -np.inf
-        for epoch in range(num_epochs):
-            for batch in dataloader:
+
+        if resume_checkpoint:
+            state_path = Path(resume_checkpoint) / "training_state.json"
+            if state_path.exists():
+                state = json.loads(state_path.read_text())
+                start_epoch = int(state.get("epoch", 0))
+                skip_until_batch = int(state.get("batch_idx", -1))
+                i = int(state.get("step", 0))
+                num_train_events = int(state.get("event", 0))
+                print(
+                    f"[resume] Continuing epoch={start_epoch}, "
+                    f"batch>{skip_until_batch}, step={i}, event={num_train_events}"
+                )
+
+        for epoch in range(start_epoch, num_epochs):
+            for batch_idx, batch in enumerate(dataloader):
+                if epoch == start_epoch and batch_idx <= skip_until_batch:
+                    continue
                 experiences = self.collect_experiences(batch, i)
                 self.num_experiences += len(experiences)
                 self.buffer.extend(experiences)
@@ -375,12 +464,23 @@ class GRPO:
                             num_train_events
                         )
 
-                        save_model()
+                        save_model(
+                            epoch=epoch,
+                            batch_idx=batch_idx,
+                            event=num_train_events,
+                            step=i,
+                        )
                         if self.mean_inference_score > best_inference_score:
                             pprint(
                                 f"New best inference score: {self.mean_inference_score:.3f}"
                             )
-                            save_model(f"_best_{best_model_id}")
+                            save_model(
+                                f"_best_{best_model_id}",
+                                epoch=epoch,
+                                batch_idx=batch_idx,
+                                event=num_train_events,
+                                step=i,
+                            )
                             best_model_id += 1
                             best_inference_score = self.mean_inference_score
 

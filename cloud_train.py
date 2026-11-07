@@ -395,6 +395,25 @@ def resolve_dpo_ranker(args: argparse.Namespace) -> str:
     return "openrouter" if os.environ.get("OPENROUTER_API_KEY") else "local"
 
 
+def checkpoint_cmd_args(args: argparse.Namespace) -> list[str]:
+    extra: list[str] = []
+    if args.resume:
+        extra.append("--resume")
+    if args.push_to_hub:
+        extra.extend(
+            [
+                "--push-to-hub",
+                "--hub-repo",
+                args.hub_repo,
+                "--hub-upload-every-saves",
+                str(args.hub_upload_every_saves),
+            ]
+        )
+        if not args.hub_private:
+            extra.append("--no-hub-private")
+    return extra
+
+
 def stage_cpt(args: argparse.Namespace, dry_run: bool, env: dict) -> Path:
     train_path, val_path = prepare_cpt_data(args, dry_run)
     run(
@@ -415,6 +434,7 @@ def stage_cpt(args: argparse.Namespace, dry_run: bool, env: dict) -> Path:
             args.cpt_batch_size,
             "--epochs",
             args.cpt_epochs,
+            *checkpoint_cmd_args(args),
         ),
         dry_run,
         env,
@@ -462,6 +482,7 @@ def stage_sft(
             args.sft_grad_accum,
             "--epochs",
             args.sft_epochs,
+            *checkpoint_cmd_args(args),
         ),
         dry_run,
         env,
@@ -583,6 +604,7 @@ def stage_dpo(
             args.dpo_grad_accum,
             "--epochs",
             args.dpo_epochs,
+            *checkpoint_cmd_args(args),
         ),
         dry_run,
         env,
@@ -670,6 +692,7 @@ def stage_grpo(
             args.grpo_grad_accum,
             "--epochs",
             args.grpo_warmup_epochs,
+            *checkpoint_cmd_args(args),
         ),
         dry_run,
         env,
@@ -707,6 +730,7 @@ def stage_grpo(
             config_path,
             "-o",
             "grpo_qwen06",
+            *checkpoint_cmd_args(args),
         ),
         dry_run,
         env,
@@ -784,6 +808,37 @@ def parse_args() -> argparse.Namespace:
         "--no-merge",
         action="store_true",
         help="Keep LoRA adapters separate instead of merging (debugging only).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume each training stage from its latest local checkpoint.",
+    )
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="Upload checkpoints and final models to Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--hub-repo",
+        default=os.environ.get("HF_CHECKPOINT_REPO"),
+        help=(
+            "HF repo id for checkpoints, e.g. user/project-checkpoints. "
+            "Defaults to HF_CHECKPOINT_REPO."
+        ),
+    )
+    parser.add_argument(
+        "--hub-private",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Create the HF checkpoint repo as private.",
+    )
+    parser.add_argument(
+        "--hub-upload-every-saves",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Upload every Nth Trainer save (1 = every save).",
     )
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--openrouter-key", default=None)
@@ -878,6 +933,12 @@ def main() -> None:
     os.chdir(REPO_ROOT)
     ensure_dirs()
     load_env_file(REPO_ROOT / args.env_file)
+    args.hub_repo = args.hub_repo or os.environ.get("HF_CHECKPOINT_REPO")
+    if args.push_to_hub and not args.hub_repo:
+        raise SystemExit(
+            "--push-to-hub requires --hub-repo (or HF_CHECKPOINT_REPO) "
+            "with a repo id such as user/project-checkpoints."
+        )
     if args.openrouter_key:
         os.environ["OPENROUTER_API_KEY"] = args.openrouter_key
 

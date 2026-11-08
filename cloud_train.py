@@ -3,7 +3,11 @@
 
 Pipeline
 --------
-    CPT -> SFT -> DPO (optional) -> reasoning warm-up -> GRPO
+    CPT -> SFT -> DPO (optional) -> reasoning -> GRPO
+
+``reasoning`` is a format warm-up SFT (teaches `` thinking...</think>`` + answer)
+run on the ``reasoning`` config of the instruction dataset. ``grpo`` reuses its
+output, so ``--stages grpo`` alone still runs the warm-up first.
 
 This is a thin orchestrator around the existing stage scripts. It does not
 change their algorithms: it prepares small cloud-friendly datasets, picks
@@ -57,7 +61,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 DATA_DIR = REPO_ROOT / "data"
 MODELS_DIR = REPO_ROOT / "models"
-STAGES = ("cpt", "sft", "dpo", "grpo")
+STAGES = ("cpt", "sft", "dpo", "reasoning", "grpo")
 
 # Installed by --install. Kept deliberately small: only what the training and
 # data-prep stages in this script import. Evaluation-only packages
@@ -349,35 +353,61 @@ def prepare_dpo_data(args: argparse.Namespace, dry_run: bool) -> Path:
     return dpo_dir
 
 
-def prepare_reasoning_data(args: argparse.Namespace, dry_run: bool) -> Path:
-    """Build reasoning train/test JSONL for the GRPO warm-up and eval."""
+def prepare_reasoning_data(
+    args: argparse.Namespace, dry_run: bool
+) -> tuple[Path, Path]:
+    """Build the reasoning-format warm-up set and the GRPO train/test slices.
+
+    The warm-up needs many rows to teach the `` thinking...</think>`` format, while
+    GRPO only rolls out a small slice per epoch. Keeping them in separate
+    directories lets us size each independently:
+      * ``data/reasoning_warmup/train.jsonl`` — up to --reasoning-warmup-samples
+      * ``data/reasoning/train.jsonl``        — up to --grpo-samples
+      * ``data/reasoning/test.jsonl``         — up to --grpo-eval-samples
+    """
     reason_dir = DATA_DIR / "reasoning"
+    warmup_dir = DATA_DIR / "reasoning_warmup"
     train_path = reason_dir / "train.jsonl"
     test_path = reason_dir / "test.jsonl"
+    warmup_path = warmup_dir / "train.jsonl"
 
-    if not args.force and train_path.exists() and test_path.exists():
-        log(f"Reusing {reason_dir}")
-        return reason_dir
+    if (
+        not args.force
+        and train_path.exists()
+        and test_path.exists()
+        and warmup_path.exists()
+    ):
+        log(f"Reusing {reason_dir} + {warmup_dir}")
+        return reason_dir, warmup_dir
     if dry_run:
-        log(f"[dry-run] would write reasoning data to {reason_dir}")
-        return reason_dir
+        log(f"[dry-run] would write reasoning data to {reason_dir} / {warmup_dir}")
+        return reason_dir, warmup_dir
 
-    train_ds = _load_hf_dataset(args.sft_dataset, split="train", config="reasoning")
-    train_ds = train_ds.shuffle(seed=args.seed).select(
-        range(min(args.grpo_samples, len(train_ds)))
+    train_ds = _load_hf_dataset(
+        args.reasoning_dataset, split="train", config=args.reasoning_dataset_config
     )
-    _write_jsonl(train_ds, train_path)
+    train_ds = train_ds.shuffle(seed=args.seed)
 
-    test_ds = _load_hf_dataset(args.sft_dataset, split="test")
+    warmup_size = len(train_ds)
+    if args.reasoning_warmup_samples >= 0:
+        warmup_size = min(args.reasoning_warmup_samples, warmup_size)
+    warmup_ds = train_ds.select(range(warmup_size))
+    _write_jsonl(warmup_ds, warmup_path)
+
+    grpo_size = min(args.grpo_samples, len(train_ds))
+    grpo_ds = train_ds.select(range(grpo_size))
+    _write_jsonl(grpo_ds, train_path)
+
+    test_ds = _load_hf_dataset(args.reasoning_dataset, split="test")
     test_ds = test_ds.shuffle(seed=args.seed).select(
         range(min(args.grpo_eval_samples, len(test_ds)))
     )
     _write_jsonl(test_ds, test_path)
     log(
-        f"Reasoning data: train={len(train_ds)} test={len(test_ds)} "
-        f"-> {reason_dir}"
+        f"Reasoning data: warmup={len(warmup_ds)} grpo_train={len(grpo_ds)} "
+        f"grpo_test={len(test_ds)} -> {reason_dir} / {warmup_dir}"
     )
-    return reason_dir
+    return reason_dir, warmup_dir
 
 
 def require_openrouter() -> None:
@@ -677,10 +707,23 @@ def write_grpo_config(
     log(f"GRPO config: {path}")
 
 
-def stage_grpo(
+def stage_reasoning(
     args: argparse.Namespace, dry_run: bool, env: dict, base_model: Path
-) -> Path:
-    reasoning_dir = prepare_reasoning_data(args, dry_run)
+) -> tuple[Path, Path, bool]:
+    """Reasoning-format warm-up (SFT that teaches  thinking...</think>).
+
+    Returns ``(reasoning_dir, grpo_model, from_sft)`` where ``reasoning_dir``
+    holds the GRPO train/test slices and ``grpo_model`` is the warm-up model to
+    hand to GRPO (merged full model, or the adapter when --no-merge).
+    """
+    reasoning_dir, warmup_dir = prepare_reasoning_data(args, dry_run)
+
+    warmup_output = MODELS_DIR / "reasoning_warmup_qwen06"
+    if args.force and warmup_output.exists() and not dry_run:
+        # A previous tiny warm-up may hold checkpoint-3 whose trainer_state has
+        # max_steps=3; resuming that into the larger format run is misleading.
+        log(f"--force: removing previous warm-up output {warmup_output}")
+        shutil.rmtree(warmup_output)
 
     run(
         stage_cmd(
@@ -689,7 +732,7 @@ def stage_grpo(
             "--base_model_id",
             base_model,
             "--dataset",
-            reasoning_dir,
+            warmup_dir,
             "--dataset_config",
             "default",
             "--output_model_id",
@@ -701,7 +744,7 @@ def stage_grpo(
             "--grad_accum",
             args.grpo_grad_accum,
             "--epochs",
-            args.grpo_warmup_epochs,
+            args.reasoning_warmup_epochs,
             *checkpoint_cmd_args(args),
         ),
         dry_run,
@@ -710,22 +753,33 @@ def stage_grpo(
 
     warmup_adapter = MODELS_DIR / "reasoning_warmup_qwen06" / "final"
     if args.no_merge:
-        grpo_model = warmup_adapter
-        from_sft = True
-    else:
-        grpo_model = MODELS_DIR / "reasoning_warmup_qwen06_merged"
-        run(
-            py(
-                "instruction_tuning/merge_adapter.py",
-                "--adapter_path",
-                warmup_adapter,
-                "--output_path",
-                grpo_model,
-            ),
-            dry_run,
-            env,
-        )
-        from_sft = False
+        return reasoning_dir, warmup_adapter, True
+
+    grpo_model = MODELS_DIR / "reasoning_warmup_qwen06_merged"
+    run(
+        py(
+            "instruction_tuning/merge_adapter.py",
+            "--adapter_path",
+            warmup_adapter,
+            "--output_path",
+            grpo_model,
+        ),
+        dry_run,
+        env,
+    )
+    return reasoning_dir, grpo_model, False
+
+
+def stage_grpo(
+    args: argparse.Namespace,
+    dry_run: bool,
+    env: dict,
+    base_model: Path,
+    reasoning: tuple[Path, Path, bool] | None = None,
+) -> Path:
+    if reasoning is None:
+        reasoning = stage_reasoning(args, dry_run, env, base_model)
+    reasoning_dir, grpo_model, from_sft = reasoning
 
     config_path = DATA_DIR / "grpo_cloud_config.yaml"
     if dry_run:
@@ -765,7 +819,9 @@ def apply_smoke(args: argparse.Namespace) -> None:
     args.grpo_samples = min(args.grpo_samples, 32)
     args.grpo_eval_samples = min(args.grpo_eval_samples, 8)
     args.grpo_epochs = min(args.grpo_epochs, 1)
-    args.grpo_warmup_epochs = min(args.grpo_warmup_epochs, 1)
+    if args.reasoning_warmup_samples >= 0:
+        args.reasoning_warmup_samples = min(args.reasoning_warmup_samples, 2000)
+    args.reasoning_warmup_epochs = min(args.reasoning_warmup_epochs, 1)
     args.grpo_max_seq_length = min(args.grpo_max_seq_length, 2048)
     args.grpo_rollout_batch_size = min(args.grpo_rollout_batch_size, 1)
     args.grpo_n_rollouts = max(2, min(args.grpo_n_rollouts, 2))
@@ -912,7 +968,31 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--grpo-samples", type=int, default=256)
     parser.add_argument("--grpo-eval-samples", type=int, default=64)
-    parser.add_argument("--grpo-warmup-epochs", type=int, default=1)
+    parser.add_argument(
+        "--reasoning-dataset",
+        default="paperbd/paper_instructions_300K-v1",
+        help="HF dataset (or local path) with a reasoning subset for warm-up.",
+    )
+    parser.add_argument(
+        "--reasoning-dataset-config",
+        default="reasoning",
+        help="Dataset config holding instruction/prompt/reasoning/output rows.",
+    )
+    parser.add_argument(
+        "--reasoning-warmup-samples",
+        type=int,
+        default=10000,
+        help=(
+            "Rows for the reasoning-format SFT warm-up. -1 uses the whole "
+            "reasoning subset. Kept separate from --grpo-samples."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-warmup-epochs",
+        type=int,
+        default=3,
+        help="Epochs for the reasoning-format SFT warm-up.",
+    )
     parser.add_argument("--grpo-epochs", type=int, default=1)
     parser.add_argument("--grpo-max-seq-length", type=int, default=1024)
     parser.add_argument("--grpo-sft-batch-size", type=int, default=4)
@@ -1036,8 +1116,20 @@ def main() -> None:
     if "dpo" in selected:
         stage_dpo(args, args.dry_run, env, resolve_sft_checkpoint("DPO"))
 
+    reasoning_output = None
+    if "reasoning" in selected:
+        reasoning_output = stage_reasoning(
+            args, args.dry_run, env, resolve_sft_checkpoint("REASONING")
+        )
+
     if "grpo" in selected:
-        stage_grpo(args, args.dry_run, env, resolve_sft_checkpoint("GRPO"))
+        stage_grpo(
+            args,
+            args.dry_run,
+            env,
+            resolve_sft_checkpoint("GRPO"),
+            reasoning_output,
+        )
 
     log("Done. Checkpoints are under ./models")
 

@@ -75,6 +75,8 @@ def run_inference(
     output_path=None,
     temperature=EVAL_TEMPERATURE,
     merge_for_eval=True,
+    require_think_format=True,
+    include_format_rewards=True,
 ):
     print("Starting inference...")
     total_scores = {}
@@ -115,6 +117,8 @@ def run_inference(
         reward_batch = score_completions(
             out,
             references,
+            require_think_format=require_think_format,
+            include_format_rewards=include_format_rewards,
         )
         diagnostics = [
             diagnose_completion(completion, reference)

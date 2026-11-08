@@ -155,18 +155,25 @@ def _completion_schema_match(completion: str, reference: str):
 
 def score_output_datatype(completion: str, reference: str) -> float:
     match = _completion_schema_match(completion, reference)
+    if match is None:
+        # No valid think block -> schema is not applicable, not a mismatch.
+        # Penalizing here floor-clamped every rollout to the same -1.0 total,
+        # which zeroed GRPO advantages before the model learned the format.
+        return 0.0
     return (
         OUTPUT_FORMAT_MATCH_REWARD
-        if match is not None and match.datatype_matches
+        if match.datatype_matches
         else OUTPUT_FORMAT_MISMATCH_REWARD
     )
 
 
 def score_output_schema(completion: str, reference: str) -> float:
     match = _completion_schema_match(completion, reference)
+    if match is None:
+        return 0.0
     return (
         OUTPUT_FORMAT_MATCH_REWARD
-        if match is not None and match.schema_matches
+        if match.schema_matches
         else OUTPUT_FORMAT_MISMATCH_REWARD
     )
 

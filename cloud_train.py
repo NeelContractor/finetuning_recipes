@@ -667,6 +667,10 @@ def write_grpo_config(
             "loss_implementation": "dr_grpo",
             "max_tokens": loss_max_tokens,
         },
+        "reward": {
+            "require_think_format": args.grpo_require_think_format,
+            "include_format_rewards": True,
+        },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -928,6 +932,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grpo-lr", type=float, default=5e-6)
     parser.add_argument("--grpo-eval-every", type=int, default=5)
     parser.add_argument("--grpo-eval-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--grpo-require-think-format",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Gate the semantic reward on a valid  thinking...</think> block. "
+            "Default off so a model that has not yet learned the format still "
+            "gets a non-zero (semantic) reward and non-zero GRPO advantages."
+        ),
+    )
     return parser.parse_args()
 
 

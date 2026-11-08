@@ -118,6 +118,13 @@ test_batch_size = config["data"]["test_batch_size"]
 max_prompt_length = config["data"].get("max_prompt_length")
 kld_weight = config["loss"]["kld_weight"]
 entropy_weight = config["loss"]["entropy_weight"]
+# If the policy doesn't yet emit valid  thinking...</think> blocks (e.g. a short
+# reasoning warm-up), requiring the format zeroes every reward and GRPO gets no
+# gradient. Configuring this lets training score semantic quality while the
+# format bonus still pulls toward valid tags.
+reward_config = config.get("reward", {})
+require_think_format = reward_config.get("require_think_format", True)
+include_format_rewards = reward_config.get("include_format_rewards", True)
 loss_implementation = config["loss"].get("loss_implementation", "dr_grpo")
 # dr_grpo's constant denominator; defaults to the generation length. Acts as an
 # lr reparametrization, so retune learning_rate if you change it.
@@ -298,6 +305,8 @@ def inference(csv_suffix=""):
         temperature=eval_temperature,
         # Merging only this rank's replica would desync DDP weights.
         merge_for_eval=accelerator.num_processes == 1,
+        require_think_format=require_think_format,
+        include_format_rewards=include_format_rewards,
     )
     summary = stats_df.describe().round(6).to_dict()
     with (logs_dir / f"eval_summary_{csv_suffix}.json").open("w") as f:
@@ -532,6 +541,8 @@ class GRPO:
         reward_batch = score_completions(
             rollouts.completion_texts,
             rollouts.references,
+            require_think_format=require_think_format,
+            include_format_rewards=include_format_rewards,
         )
 
         # advantages = [num_examples, n_rollouts]

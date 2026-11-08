@@ -1,6 +1,6 @@
 # Fine-Tuning Recipes
 
-End-to-end post-training recipes for small language models — continued pre-training (CPT), supervised fine-tuning (SFT), and preference alignment (DPO/ORPO, reward models, GRPO).
+End-to-end post-training recipes for small language models — continued pre-training (CPT), supervised fine-tuning (SFT), preference alignment (DPO/ORPO, reward models), and reasoning (format warm-up + GRPO).
 
 This project is based on the [finetuning_recipes](https://github.com/avbiswas/finetuning_recipes) repo from the Neural Breakdown YouTube course. It runs on **macOS (Apple Silicon via MLX)**, Linux (CUDA via Unsloth), and Windows/CPU.
 
@@ -17,10 +17,22 @@ This project is based on the [finetuning_recipes](https://github.com/avbiswas/fi
 | **SFT** (Supervised Fine-Tuning) | `instruction_tuning/` | Teach the model to answer instructions (ChatML format) |
 | **DPO / ORPO** | `preference_optimization/` | Align with human preference pairs / ranked responses |
 | **Reward model** | `reward_models/` | Train a scorer that rates "how good" an answer is |
-| **GRPO / Reasoning** | `reasoning/` | RL with verifiable rewards (teaching `thinking` / hidden reasoning) |
+| **Reasoning format** | `reasoning/sft_warmup.py` | Teach the `<think> ... </think>` format before RL |
+| **GRPO / Reasoning** | `reasoning/grpo/` | RL with verifiable rewards (reward model + format/schema checks) |
 | **Diversity evals** | `preference_optimization/diversity_evals/` | Measure response diversity (EAD, SBERT, Vendi) |
 
-**The whole pipeline in one line:** `pre-train on papers → follow instructions → learn preferences → score answers → reason`.
+**The whole pipeline in one line:** `pre-train on papers → follow instructions → learn preferences → score answers → learn the reasoning format → reason (GRPO)`.
+
+> **Running on a GPU (Kaggle/Colab)?** [`cloud_train.py`](cloud_train.py) is a
+> one-command orchestrator for the full pipeline — data prep → CPT → SFT → DPO →
+> reasoning-format warm-up → GRPO — with DDP, checkpoint resume, smoke tests,
+> and Hub uploads. See [COLAB.md](COLAB.md).
+>
+> ```bash
+> python cloud_train.py --install --num-gpus 2
+> # retrain the reasoning format, then GRPO:
+> python cloud_train.py --stages reasoning grpo --num-gpus 2
+> ```
 
 ---
 
@@ -63,7 +75,7 @@ For the whole project we use the tiny **0.6B** Qwen model:
 
 | Purpose | Model ID | Notes |
 |---------|----------|-------|
-| Base for **all training** (CPT → SFT → DPO → GRPO) | `Qwen/Qwen3-0.6B` | HF Transformers/PEFT base (~600M params) |
+| Base for **all training** (CPT → SFT → DPO / reasoning → GRPO) | `Qwen/Qwen3-0.6B` | HF Transformers/PEFT base (~600M params) |
 | Local **MLX inference** (ranking, chat, evals) | `mlx-community/Qwen3-0.6B-4bit` | 4-bit MLX quant (~350 MB) — fits 8 GB easily |
 | OpenRouter **LLM judge** (free) | `nvidia/nemotron-3-super-120b-a12b:free` | Default judge model in the code |
 
@@ -281,7 +293,11 @@ uv run python preference_optimization/evaluate_reward_model.py \
 
 ### Step 6 — Reasoning / RLVR (GRPO)
 
-Teach the model to produce a `thinking / `<reply>` structure with verifiable rewards. This is the most advanced stage.
+Teach the model to emit a hidden `think` reasoning block before the final answer with
+verifiable rewards. The reasoning branch starts from the **SFT** model (not the
+DPO adapter); [`cloud_train.py`](cloud_train.py) `--stages reasoning` automates
+the format warm-up on the `reasoning` subset (default 10k rows, 3 epochs) before
+GRPO. This is the most advanced stage.
 
 **6a. SFT warm-up** to teach the reasoning format (8 GB-safe flags):
 
@@ -294,6 +310,11 @@ uv run python reasoning/sft_warmup.py \
   --max_seq_length 1024 \
   --batch_size 4 --grad_accum 8 --epochs 3
 ```
+
+> Size this stage properly: the first cloud run used only ~168 rows / 3 optimizer
+> steps and the model never learned the tags. The orchestrator now defaults to
+> 10,000 rows × 3 epochs (`--reasoning-warmup-samples`,
+> `--reasoning-warmup-epochs`) on the dedicated `reasoning` subset.
 
 **6b. Edit the GRPO config** for the small model + 8 GB. Open `reasoning/grpo/config.yaml`, and at minimum change:
 
@@ -354,12 +375,17 @@ fine_tuning/
 ├── preference_optimization/    # DPO / ORPO + response ranking
 │   └── diversity_evals/        #   EAD / SBERT / Vendi diversity
 ├── reward_models/              # Reward model training
-├── reasoning/                  # GRPO / RL with verifiable rewards
+├── reasoning/                  # Reasoning warm-up + GRPO / RLVR
 │   ├── sft_warmup.py           #   Reasoning-format SFT
+│   ├── env.py                  #   Rewards (think format, schema, reward model)
+│   ├── eval_checkpoint.py      #   Score a checkpoint on held-out prompts
 │   └── grpo/                   #   GRPO trainer + config.yaml
+├── cloud_train.py              # One-command pipeline (CPT→SFT→DPO→reasoning→GRPO)
+├── checkpointing.py            # Resume + Hugging Face Hub upload helpers
 ├── paper_researcher/           # Model-agnostic inference wrapper
 ├── mlx_export.py               # Merge + convert to MLX
 ├── check_env.sh                # CUDA wheel diagnostic
+├── COLAB.md                    # Kaggle/Colab cloud walkthrough
 └── pyproject.toml              # Project + dependency manifest
 ```
 
@@ -384,4 +410,6 @@ fine_tuning/
 - [text-albumentations](https://github.com/avbiswas/text-albumentations) — dataset generation & augmentation
 - [neural-txt](https://github.com/avbiswas/neural-txt) — inference harness & reward model
 - [paper_instructions_300K-v1](https://huggingface.co/datasets/paperbd/paper_instructions_300K-v1) — instruction dataset from arXiv papers
+- [neuraltxt-reward-22M](https://huggingface.co/paperbd/neuraltxt-reward-22M) — reward model used by GRPO
+- [finetuning-checkpoints (HF)](https://huggingface.co/NeelContractor/finetuning-checkpoints) — checkpoint repository from this pipeline (CPT → SFT → DPO → reasoning → GRPO)
 - [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) — the tiny base model used throughout

@@ -12,12 +12,20 @@ import os
 import torch
 
 
-def merge_adapter(adapter_path: str, output_path: str):
+def resolve_fp16_base(base_model_id: str) -> str:
+    """Map an Unsloth 4-bit repo id to its non-quantized full-precision base."""
+    for suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
+        if base_model_id.endswith(suffix):
+            return base_model_id[: -len(suffix)]
+    return base_model_id
+
+
+def merge_adapter(adapter_path: str, output_path: str, base_model_id: str | None = None):
     # Read base model from adapter config
     config_path = os.path.join(adapter_path, "adapter_config.json")
     with open(config_path) as f:
         adapter_config = json.load(f)
-    base_model_id = adapter_config["base_model_name_or_path"]
+    base_model_id = base_model_id or adapter_config["base_model_name_or_path"]
     task_type = adapter_config.get("task_type")
     print(f"Base model: {base_model_id}")
     print(f"Task type:  {task_type}")
@@ -25,7 +33,7 @@ def merge_adapter(adapter_path: str, output_path: str):
     print(f"Output:     {output_path}")
 
     # Strip the bnb-4bit suffix to get the fp16 base — merge requires full precision
-    hf_base_id = base_model_id.replace("-bnb-4bit", "")
+    hf_base_id = resolve_fp16_base(base_model_id)
     if hf_base_id != base_model_id:
         print(f"Using non-quantized base for merge: {hf_base_id}")
 
@@ -60,5 +68,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter_path", required=True)
     parser.add_argument("--output_path", required=True)
+    parser.add_argument(
+        "--base_model_id",
+        default=None,
+        help="Override the base model id (defaults to adapter_config.json).",
+    )
     args = parser.parse_args()
-    merge_adapter(args.adapter_path, args.output_path)
+    merge_adapter(args.adapter_path, args.output_path, args.base_model_id)

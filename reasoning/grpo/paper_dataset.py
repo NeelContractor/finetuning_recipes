@@ -26,6 +26,7 @@ class PaperInstructionDataset(Dataset):
         tokenizer=None,
         data_size=None,
         seed=SEED,
+        max_prompt_length=None,
     ):
         self.data = _load_dataset(dataset_name_or_path, split)
         if seed is not None:
@@ -33,6 +34,7 @@ class PaperInstructionDataset(Dataset):
         if data_size is not None:
             self.data = self.data.select(range(min(data_size, len(self.data))))
         self.tokenizer = tokenizer
+        self.max_prompt_length = max_prompt_length
 
     def __len__(self):
         return len(self.data)
@@ -56,6 +58,8 @@ class PaperInstructionDataset(Dataset):
                     add_generation_prompt=True,
                 ),
                 return_tensors="pt",
+                truncation=self.max_prompt_length is not None,
+                max_length=self.max_prompt_length,
             )
             data["input_ids"] = tokenized["input_ids"]
             data["attention_mask"] = tokenized["attention_mask"]
@@ -101,6 +105,7 @@ def get_dataloader(
     split="train",
     data_size=None,
     seed=SEED,
+    max_prompt_length=None,
     **kwargs,
 ):
     del kwargs
@@ -110,6 +115,7 @@ def get_dataloader(
         tokenizer=tokenizer,
         data_size=data_size,
         seed=seed,
+        max_prompt_length=max_prompt_length,
     )
     return DataLoader(
         dataset=dataset,

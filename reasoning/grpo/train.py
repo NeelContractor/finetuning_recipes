@@ -115,6 +115,7 @@ eval_data_size = config["data"].get(
     config["data"].get("test_data_size", 512),
 )
 test_batch_size = config["data"]["test_batch_size"]
+max_prompt_length = config["data"].get("max_prompt_length")
 kld_weight = config["loss"]["kld_weight"]
 entropy_weight = config["loss"]["entropy_weight"]
 loss_implementation = config["loss"].get("loss_implementation", "dr_grpo")
@@ -208,6 +209,7 @@ dataloader = paper_dataset.get_dataloader(
     split=config["data"].get("train_split", "train"),
     data_size=train_data_size,
     seed=train_dataset_seed,
+    max_prompt_length=max_prompt_length,
 )
 test_dataloader = paper_dataset.get_dataloader(
     dataset_name_or_path,
@@ -216,6 +218,7 @@ test_dataloader = paper_dataset.get_dataloader(
     split=config["data"].get("test_split", "test"),
     data_size=eval_data_size,
     seed=test_dataset_seed,
+    max_prompt_length=max_prompt_length,
 )
 
 optimizer = torch.optim.Adam(llm.parameters(), lr=learning_rate)

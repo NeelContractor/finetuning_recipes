@@ -37,6 +37,13 @@ ML_TOPIC_QUERIES = [
 ]
 
 
+def iter_search_results(search: arxiv.Search):
+    """Yield results across arxiv<2 (Search.results) and arxiv>=2 (Client.results)."""
+    if hasattr(arxiv, "Client"):
+        return arxiv.Client().results(search)
+    return search.results()
+
+
 def normalize_arxiv_id(raw_id: str) -> str:
     return re.sub(r"v\d+$", "", raw_id.rsplit("/", 1)[-1])
 
@@ -74,7 +81,7 @@ def collect_candidates(
             max_results=max_results_per_topic,
             sort_by=arxiv.SortCriterion.SubmittedDate,
         )
-        for result in search.results():
+        for result in iter_search_results(search):
             arxiv_id = normalize_arxiv_id(result.entry_id)
             if arxiv_id in seen:
                 continue

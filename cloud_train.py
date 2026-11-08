@@ -654,6 +654,9 @@ def write_grpo_config(
             "train_data_size": args.grpo_samples,
             "eval_data_size": args.grpo_eval_samples,
             "test_batch_size": args.grpo_eval_batch_size,
+            "max_prompt_length": max(
+                128, args.grpo_max_seq_length - args.grpo_max_new_tokens
+            ),
         },
         "loss": {
             "kld_weight": 0.02,
@@ -756,11 +759,11 @@ def apply_smoke(args: argparse.Namespace) -> None:
     args.grpo_eval_samples = min(args.grpo_eval_samples, 8)
     args.grpo_epochs = min(args.grpo_epochs, 1)
     args.grpo_warmup_epochs = min(args.grpo_warmup_epochs, 1)
-    args.grpo_max_seq_length = min(args.grpo_max_seq_length, 512)
-    args.grpo_rollout_batch_size = min(args.grpo_rollout_batch_size, 2)
+    args.grpo_max_seq_length = min(args.grpo_max_seq_length, 2048)
+    args.grpo_rollout_batch_size = min(args.grpo_rollout_batch_size, 1)
     args.grpo_n_rollouts = max(2, min(args.grpo_n_rollouts, 2))
-    args.grpo_batch_size = min(args.grpo_batch_size, 2)
-    args.grpo_buffer_size = min(args.grpo_buffer_size, 16)
+    args.grpo_batch_size = min(args.grpo_batch_size, 1)
+    args.grpo_buffer_size = min(args.grpo_buffer_size, 8)
     args.grpo_max_new_tokens = min(args.grpo_max_new_tokens, 64)
     args.grpo_loss_max_tokens = min(args.grpo_loss_max_tokens, 64)
     args.grpo_num_repeats = min(args.grpo_num_repeats, 1)
@@ -946,6 +949,7 @@ def main() -> None:
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env.setdefault("WANDB_DISABLED", "true")
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     if (
         args.dpo_source == "generate"

@@ -207,7 +207,14 @@ model = FastLanguageModel.get_peft_model(
     loftq_config=None,
 )
 
-split = dataset.train_test_split(test_size=0.02, seed=SEED)
+if len(dataset) < 2:
+    raise ValueError(
+        f"Only {len(dataset)} reasoning example(s) fit within "
+        f"max_seq_length={args.max_seq_length}; raise --max_seq_length or add data."
+    )
+split = dataset.train_test_split(
+    test_size=1 if len(dataset) < 50 else 0.02, seed=SEED
+)
 train_dataset = split["train"]
 val_dataset = split["test"]
 

@@ -13,6 +13,13 @@ output_dir = Path("papers")
 output_dir.mkdir(exist_ok=True)
 
 
+def iter_search_results(search: arxiv.Search):
+    """Yield results across arxiv<2 (Search.results) and arxiv>=2 (Client.results)."""
+    if hasattr(arxiv, "Client"):
+        return arxiv.Client().results(search)
+    return search.results()
+
+
 def query_arxiv(
     query: str = "transformer large language model", max_results: int = 50
 ) -> list[dict]:
@@ -24,7 +31,7 @@ def query_arxiv(
     )
 
     papers = []
-    for result in search.results():
+    for result in iter_search_results(search):
         # if result.published.year < 2025:
         #     continue
         # strip version suffix (e.g. 2501.12345v2 -> 2501.12345)

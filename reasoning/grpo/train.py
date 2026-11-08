@@ -136,6 +136,10 @@ if resume_checkpoint:
     print(f"[resume] GRPO model: {model_name} (from_sft={from_sft})")
 buffer_size = config["training"].get("buffer_size", 500)
 num_repeats = config["training"].get("num_repeats", 5)
+# Max sequences per forward/backward. Kept small (default 1) because the policy
+# and reference forwards each produce a [B, T, vocab] float32 logits tensor;
+# b=4 x T=1024 x ~152k vocab is >2 GB per model and OOMs a 14 GB T4.
+micro_batch_size = config["training"].get("micro_batch_size", 1)
 eval_every_train_step = config["training"].get("eval_every_train_step", 8)
 std_normalize_advantages = config["training"].get("std_normalize_advantages", False)
 attn_implementation = ATTN_IMPLEMENTATION
@@ -143,7 +147,13 @@ attn_implementation = ATTN_IMPLEMENTATION
 if n_rollouts < 2:
     raise ValueError("GRPO requires n_rollouts >= 2 so group advantages are non-zero.")
 
-accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps)
+# train_on_buffer calls optimizer.step() once per logical batch, so accelerate
+# must not hold back gradient sync: with gradient_accumulation_steps > 1 it
+# puts every backward after the first inside no_sync, leaving DDP ranks
+# unsynchronized. Keep it at 1 (micro-batching inside train_on_batch handles
+# memory, not the outer loop). gradient_accumulation_steps is retained in the
+# config for reference only.
+accelerator = Accelerator(gradient_accumulation_steps=1)
 
 if from_sft:
     # Load the existing LoRA model directly
@@ -512,10 +522,11 @@ class GRPO:
                 n_rollouts=n_rollouts,
                 top_p=top_p,
                 temperature=temperature,
-                # Reuse the training batch size to chunk the old_log_probs forward:
-                # the training forward over this many sequences already fits (and is
-                # heavier), so the rollout forward over the same chunk is safe.
-                logprob_chunk_size=batch_size,
+                # Chunk the old_log_probs forward one sequence at a time: even in
+                # inference mode each chunk materializes [B, T, vocab] float32
+                # logits, so keep B=1 to stay well under the T4 limit while the
+                # generation KV cache may still be resident.
+                logprob_chunk_size=1,
             )
 
         reward_batch = score_completions(
@@ -563,8 +574,7 @@ class GRPO:
                     training_batch = self.buffer[i : i + batch_size]
                     self.num_training += 1
                     num_steps += 1
-                    loss = self.train_on_batch(training_batch)
-                    accelerator.backward(loss)
+                    self.train_on_batch(training_batch)
                     needs_training = True
                     optimizer.step()
                     optimizer.zero_grad()
@@ -581,6 +591,28 @@ class GRPO:
         llm.eval()
 
     def train_on_batch(self, batch):
+        """Backprop one logical batch as several memory-bounded micro-batches.
+
+        Each micro-batch runs its own forward/backward, so peak memory is set by
+        ``micro_batch_size`` sequences rather than ``batch_size``. Losses are
+        scaled by the micro-batch share so the summed gradient equals the
+        original full-batch loss (exact for the default ``dr_grpo`` and
+        ``grpo`` reductions, which average per-response losses).
+        """
+        total_examples = len(batch)
+        micro = max(1, min(micro_batch_size, total_examples))
+        loss_value = 0.0
+        for start in range(0, total_examples, micro):
+            sub_batch = batch[start : start + micro]
+            loss = self._compute_loss(sub_batch)
+            weight = len(sub_batch) / total_examples
+            accelerator.backward(loss * weight)
+            loss_value += loss.detach().item() * weight
+            del loss
+        self.losses.append(loss_value)
+        return loss_value
+
+    def _compute_loss(self, batch):
         input_ids = pad_sequence(
             [x[0] for x in batch],
             batch_first=True,
@@ -617,6 +649,7 @@ class GRPO:
             llm,
             input_ids,
             attention_masks,
+            return_full=entropy_weight > 0,
         )
         reasoning_loss = calculate_grpo_loss(
             log_probs,
@@ -631,13 +664,13 @@ class GRPO:
 
         if kld_weight > 0:
             with torch.no_grad():
-                _, ref_log_probs = calculate_log_probs(
+                ref_log_probs, _ = calculate_log_probs(
                     ref_llm,
                     input_ids,
                     attention_masks,
                 )
             kld_loss = calculate_kld_loss(
-                full_log_probs,
+                log_probs,
                 ref_log_probs,
                 response_masks,
                 loss_implementation=loss_implementation,
@@ -654,7 +687,6 @@ class GRPO:
             )
             total_loss = total_loss - entropy_weight * entropy
 
-        self.losses.append(total_loss.item())
         return total_loss
 
 

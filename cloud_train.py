@@ -637,6 +637,9 @@ def write_grpo_config(
             "temperature": 0.5,
             "eval_temperature": 0.2,
             "batch_size": args.grpo_batch_size,
+            # Cap sequences per forward/backward so the policy+ref full-vocab
+            # logits fit on a 14 GB T4 even when batch_size > 1.
+            "micro_batch_size": 1,
             "gradient_accumulation_steps": args.grpo_grad_accum,
             "learning_rate": args.grpo_lr,
             "num_epochs": args.grpo_epochs,

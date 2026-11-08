@@ -79,9 +79,19 @@ def calculate_kld_loss(
     loss_implementation="dr_grpo",
     max_tokens=MAX_TOKENS,
 ):
-    kl = torch.exp(log_probs) * (log_probs - ref_log_probs.detach())
-    kl = kl.sum(dim=-1)
-    return _aggregate_token_loss(kl, response_mask, loss_implementation, max_tokens)
+    """KL(policy || ref) via the k3 estimator, using only sampled-token log-probs.
+
+    k3 = exp(logQ - logP) - (logQ - logP) - 1, which is non-negative and
+    unbiased for samples from the policy. Working on ``[B, T]`` token log-probs
+    instead of the full ``[B, T, vocab]`` distributions is what keeps this
+    affordable on a T4 — the full-vocab form allocated several float32
+    ``[B, T, vocab]`` tensors per model and OOM'd at ``batch_size=4``.
+    """
+    log_ratio = ref_log_probs.detach() - log_probs
+    kl = torch.exp(log_ratio) - log_ratio - 1.0
+    return _aggregate_token_loss(
+        kl, response_mask, loss_implementation, max_tokens
+    )
 
 
 def calculate_entropy(

@@ -36,15 +36,24 @@ class RolloutBatch:
         ]
 
 
-def calculate_log_probs(model, input_ids, attention_masks):
-    logits = model(input_ids=input_ids, attention_mask=attention_masks).logits
-    full_log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
-    token_log_probs = torch.gather(
-        full_log_probs,
-        dim=2,
-        index=input_ids[:, 1:].unsqueeze(-1),
-    ).squeeze(-1)
-    return token_log_probs, full_log_probs
+def calculate_log_probs(model, input_ids, attention_masks, return_full=False):
+    """Token log-probs (and optionally the full log-softmax).
+
+    ``logsumexp`` + gather avoids materializing a second ``[B, T, vocab]``
+    tensor for the log-softmax output. On a T4 with ``batch_size > 1`` the two
+    full-vocab float32 tensors (logits + log_softmax, ~2.5 GB each at b=4) are
+    the difference between fitting and OOMing, so only build the full tensor
+    when a caller actually needs it (entropy).
+    """
+    logits = model(input_ids=input_ids, attention_mask=attention_masks).logits[:, :-1, :]
+    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+    token_log_probs = (
+        logits.gather(dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+        - log_z.squeeze(-1)
+    )
+    if not return_full:
+        return token_log_probs, None
+    return token_log_probs, logits - log_z
 
 
 def calculate_token_log_probs(model, input_ids, attention_masks, chunk_size):
@@ -59,13 +68,14 @@ def calculate_token_log_probs(model, input_ids, attention_masks, chunk_size):
     for start in range(0, input_ids.shape[0], max(chunk_size, 1)):
         ids = input_ids[start : start + max(chunk_size, 1)]
         mask = attention_masks[start : start + max(chunk_size, 1)]
-        logits = model(input_ids=ids, attention_mask=mask).logits
-        log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
-        token_log_probs = torch.gather(
-            log_probs, dim=2, index=ids[:, 1:].unsqueeze(-1)
-        ).squeeze(-1)
+        logits = model(input_ids=ids, attention_mask=mask).logits[:, :-1, :]
+        log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+        token_log_probs = (
+            logits.gather(dim=-1, index=ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+            - log_z.squeeze(-1)
+        )
         chunks.append(token_log_probs)
-        del logits, log_probs
+        del logits, log_z
     return torch.cat(chunks, dim=0)
 
 

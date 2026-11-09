@@ -26,7 +26,8 @@ This project is based on the [finetuning_recipes](https://github.com/avbiswas/fi
 > **Running on a GPU (Kaggle/Colab)?** [`cloud_train.py`](cloud_train.py) is a
 > one-command orchestrator for the full pipeline — data prep → CPT → SFT → DPO →
 > reasoning-format warm-up → GRPO — with DDP, checkpoint resume, smoke tests,
-> and Hub uploads. See [COLAB.md](COLAB.md).
+> and Hub uploads. See [COLAB.md](COLAB.md) and the
+> [reasoning runbook](REASON_TRAINING.md).
 >
 > ```bash
 > python cloud_train.py --install --num-gpus 2
@@ -340,6 +341,13 @@ uv run python reasoning/grpo/train.py reasoning/grpo/config.yaml -o reasoning_qw
 
 > GRPO is the heaviest stage. Keep `rollout_batch_size` small and watch Activity Monitor; lower `n_rollouts` / `buffer_size` further if memory pressure spikes.
 
+**Measured run (Kaggle 2× T4):** warm-up 10,000 → 6,911 rows after the
+1024-token filter, 3 epochs / 324 steps (~46 min); GRPO 1 epoch / 8 events
+(~50 min). At the event-5 eval (64 prompts): `think_format_reward` **0.953**
+(was `0.000` before the warm-up stage), datatype/schema match **93.8%**,
+`total_reward` **2.355**, best inference score **2.355**. Total ~1 h 40 m.
+See [REASON_TRAINING.md](REASON_TRAINING.md) for the exact Kaggle steps.
+
 ---
 
 ## 6. Environment check (CUDA boxes only)
@@ -386,6 +394,7 @@ fine_tuning/
 ├── mlx_export.py               # Merge + convert to MLX
 ├── check_env.sh                # CUDA wheel diagnostic
 ├── COLAB.md                    # Kaggle/Colab cloud walkthrough
+├── REASON_TRAINING.md          # Kaggle reasoning/GRPO runbook
 └── pyproject.toml              # Project + dependency manifest
 ```
 

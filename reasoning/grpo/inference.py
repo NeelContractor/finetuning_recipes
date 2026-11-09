@@ -158,11 +158,11 @@ if __name__ == "__main__":
     # Load model with optimizations
     accelerator = Accelerator()
 
-    dtype = (
-        torch.bfloat16
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        else (torch.float16 if torch.cuda.is_available() else torch.float32)
-    )
+    if torch.cuda.is_available():
+        major = torch.cuda.get_device_capability()[0]
+        dtype = torch.bfloat16 if major >= 8 else torch.float16
+    else:
+        dtype = torch.float32
     llm = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=dtype,

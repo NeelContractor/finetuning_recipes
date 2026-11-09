@@ -49,7 +49,8 @@ except ModuleNotFoundError:
 def _pick_dtype():
     """Use bf16 on Ampere+, fp16 on older CUDA GPUs (T4/P100), fp32 on CPU."""
     if torch.cuda.is_available():
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        major = torch.cuda.get_device_capability()[0]
+        return torch.bfloat16 if major >= 8 else torch.float16
     return torch.float32
 
 

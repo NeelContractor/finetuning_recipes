@@ -170,7 +170,7 @@ def report_environment() -> None:
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
     print(f"GPU 0: {name} (sm{major}{minor}, {total_gb:.1f} GB)")
     print(f"GPUs visible: {torch.cuda.device_count()}")
-    print(f"bf16 supported: {torch.cuda.is_bf16_supported()}")
+    print(f"bf16 supported (native sm80+): {major >= 8}")
     print(f"torch: {torch.__version__}")
     if major < 7:
         print(

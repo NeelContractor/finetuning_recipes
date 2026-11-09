@@ -220,6 +220,14 @@ val_dataset = split["test"]
 
 max_grad_norm = 1.0
 
+# torch>=2.10's is_bf16_supported() defaults to including_emulation=True, which
+# reports True on T4/P100 and makes the Trainer silently pick a much slower
+# emulated-bf16 path. Gate on native support (Ampere / sm80) and use fp16 on
+# older GPUs instead.
+bf16_supported = (
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+)
+
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
@@ -251,8 +259,8 @@ trainer = SFTTrainer(
         save_total_limit=3,
         eval_strategy="steps",
         eval_steps=50,
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+        bf16=bf16_supported,
+        fp16=torch.cuda.is_available() and not bf16_supported,
         ddp_find_unused_parameters=False,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
